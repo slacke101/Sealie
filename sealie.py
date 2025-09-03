@@ -1,6 +1,12 @@
 import sys
 import json
 from PIL import Image, ImageTk
+import re
+import logging
+import webbrowser
+from datetime import datetime
+import platform
+import psutil
 
 print("Python executable:", sys.executable)
 import tkinter as tk
@@ -28,6 +34,22 @@ try:
 except ImportError:
     GPT4ALL_AVAILABLE = False
 
+# Application metadata
+APP_NAME = "Sealie Sense Studio"
+APP_VERSION = "1.0.0"
+APP_DESCRIPTION = "Professional IoT Sensor Data Visualization & Analysis Platform"
+APP_AUTHOR = "Castron Technologies"
+APP_WEBSITE = "https://castron.org"
+APP_COPYRIGHT = "© 2024 Castron Technologies. All rights reserved."
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("sealink.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
 
 class SeaLinkApp(tb.Window):
     """
@@ -40,32 +62,51 @@ class SeaLinkApp(tb.Window):
         Initialize the SeaLink Dashboard application window and state.
         """
         super().__init__(themename="superhero")
-        self.title("SeaLink Dashboard")
-        self.geometry("1200x800")
+        self.title(f"{APP_NAME} v{APP_VERSION}")
+        self.geometry("1400x900")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.resizable(True, True)
+
+        # Set application icon and properties
+        try:
+            self.iconbitmap("sealink_icon.ico")  # Will be created later
+        except:
+            pass  # Icon file doesn't exist yet
+
+        # Professional window properties
+        self.configure_window_properties()
+
+        # Initialize logging
+        logger.info(f"Starting {APP_NAME} v{APP_VERSION}")
+        logger.info(f"Application initialized at {datetime.now()}")
         # Modern, professional color palette (black, teal, silver)
         self.night_mode = True
         self.colors = {
             "night": {
-                "bg": "#101214",  # deep black
-                "sidebar": "#181A1B",  # almost black
-                "topbar": "#181A1B",  # almost black
-                "card": "#23272A",  # graphite dark
-                "fg": "#F5F6FA",  # off-white
-                "accent": "#20CFCF",  # teal
-                "highlight": "#C0C0C0",  # silver
-                "shadow": "#0A0B0C",  # shadow for depth
+                "bg": "#0D1117",  # GitHub dark
+                "sidebar": "#161B22",  # GitHub dark sidebar
+                "topbar": "#161B22",  # GitHub dark topbar
+                "card": "#21262D",  # GitHub dark card
+                "fg": "#F0F6FC",  # GitHub light text
+                "accent": "#58A6FF",  # GitHub blue
+                "highlight": "#7C3AED",  # Purple accent
+                "shadow": "#000000",  # Pure black shadow
+                "success": "#3FB950",  # GitHub green
+                "warning": "#D29922",  # GitHub yellow
+                "danger": "#F85149",  # GitHub red
             },
             "day": {
-                "bg": "#F5F6FA",  # off-white
-                "sidebar": "#E0E0E0",  # silver
-                "topbar": "#C0C0C0",  # silver
-                "card": "#FFFFFF",  # white
-                "fg": "#181A1B",  # almost black
-                "accent": "#20CFCF",  # teal
-                "highlight": "#23272A",  # graphite
-                "shadow": "#B0B0B0",  # shadow for depth
+                "bg": "#FFFFFF",  # Pure white
+                "sidebar": "#F6F8FA",  # GitHub light sidebar
+                "topbar": "#F6F8FA",  # GitHub light topbar
+                "card": "#FFFFFF",  # Pure white
+                "fg": "#24292F",  # GitHub dark text
+                "accent": "#0969DA",  # GitHub blue
+                "highlight": "#8250DF",  # Purple accent
+                "shadow": "#D0D7DE",  # Light shadow
+                "success": "#1A7F37",  # GitHub green
+                "warning": "#9A6700",  # GitHub yellow
+                "danger": "#CF222E",  # GitHub red
             },
         }
         self.current_theme = "night"
@@ -80,6 +121,10 @@ class SeaLinkApp(tb.Window):
         self.is_connected = False
         self.read_thread = None
         self.after_job = None
+        # Sidebar state defaults (initialized early to avoid callback races)
+        self.sidebar_expanded = True
+        self.sidebar_min_width = 48
+        self.sidebar_max_width = 220
 
         # Sensor data
         self.time_data, self.temp_data, self.hum_data = [], [], []
@@ -87,54 +132,381 @@ class SeaLinkApp(tb.Window):
         self.cal_yaw, self.cal_pitch, self.cal_roll = 0, 0, 0
         self.start_time = time.time()
 
-        self.sensor_templates = [
-            {
-                "type": "DHT",
-                "name": "DHT Sensor",
-                "icon": "🌡️",
-                "fields": ["Temperature (°C)", "Humidity (%)"],
-                "graph": "line",
-            },
-            {
-                "type": "IMU",
-                "name": "3D Orientation",
-                "icon": "🧭",
-                "fields": ["Yaw (°)", "Pitch (°)", "Roll (°)"],
-                "graph": "line3d",
-            },
-            # Add more templates here (ECG, Pulse, Gas, etc.)
-        ]
         self.active_sensors = []  # List of dicts: {type, name, port, ...}
+        self._template_cache = None  # lazy-loaded sensor templates
+        self.generic_streams = {}  # name -> {"time":[], field->[...]} for non-DHT/IMU
+        self._sensors_refresh_pending = False
+        self._as7341_buf = {"data": {}, "t": 0.0}
+        self.as7341_state = {}  # name -> {"bars":[], "canvas":..., "baseline":dict, "smoothed":list}
+        self.imu_widgets = {}  # sensor name -> {yaw:Meter, pitch:Meter, roll:Meter}
 
         self.data_log = []  # List of dicts: {timestamp, sensor, values}
         self.is_recording = False
         self.recording_file = None
 
         if GPT4ALL_AVAILABLE:
-            # NOTE: You must download a compatible model, e.g. 'gpt4all-falcon-q4_0.gguf', and place it in the default gpt4all models directory.
-            self.llm = GPT4All("gpt4all-falcon-q4_0.gguf", allow_download=False)
+            # NOTE: Model will be downloaded automatically on first use
+            self.llm = None  # Will be initialized in init_ai() when needed
         else:
             self.llm = None
 
+        self.build_menu_bar()
         self.build_layout()
         self.refresh_ports()
         self.schedule_simulation()
         self.apply_theme()
+        self.init_ai()
+
+    def configure_window_properties(self):
+        """Configure professional window properties."""
+        # Center window on screen
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        # Set window state
+        self.state("normal")
+
+        # Configure window attributes for professional appearance
+        try:
+            # Windows-specific attributes
+            if sys.platform == "win32":
+                self.attributes("-alpha", 0.98)  # Slight transparency for modern look
+        except:
+            pass
+
+    def build_menu_bar(self):
+        """Build professional menu bar."""
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+
+        # File menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Export Data...", command=self.export_all_data)
+        file_menu.add_command(label="Import Data...", command=self.import_data)
+        file_menu.add_separator()
+        file_menu.add_command(label="Settings...", command=self.show_settings)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
+        tools_menu.add_command(label="Clear All Data", command=self.clear_data)
+        tools_menu.add_separator()
+        tools_menu.add_command(
+            label="System Information", command=self.show_system_info
+        )
+        tools_menu.add_command(label="View Logs", command=self.show_logs)
+
+        # Analysis menu
+        analysis_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Analysis", menu=analysis_menu)
+        analysis_menu.add_command(
+            label="Calculate Statistics", command=self.calculate_statistics
+        )
+        analysis_menu.add_command(
+            label="Generate Report", command=self.generate_data_report
+        )
+        analysis_menu.add_command(label="Plot Trends", command=self.plot_data_trends)
+        analysis_menu.add_command(
+            label="Advanced Analysis", command=self.advanced_data_analysis
+        )
+
+        # Help menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="User Guide", command=self.show_user_guide)
+        help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self.show_about_dialog)
+
+    def import_data(self):
+        """Import data from CSV file."""
+        from tkinter import filedialog
+
+        file = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Import Data",
+        )
+        if file:
+            try:
+                import csv
+
+                imported_count = 0
+                with open(file, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Convert row to our data format
+                        values = []
+                        for i in range(1, 11):  # Value1 to Value10
+                            val = row.get(f"Value{i}", "")
+                            values.append(val if val else None)
+
+                        entry = {
+                            "timestamp": row.get("Timestamp", ""),
+                            "sensor": row.get("Sensor", ""),
+                            "values": values,
+                        }
+                        self.data_log.append(entry)
+                        imported_count += 1
+
+                # Refresh the data table
+                self.build_data_tab()
+                self.show_notification(
+                    f"Imported {imported_count} data points", style="success"
+                )
+                logger.info(f"Imported {imported_count} data points from {file}")
+
+            except Exception as e:
+                messagebox.showerror("Import Error", f"Failed to import data: {e}")
+                logger.error(f"Data import failed: {e}")
+
+    def show_user_guide(self):
+        """Show user guide in a new window."""
+        guide_window = tk.Toplevel(self)
+        guide_window.title("User Guide")
+        guide_window.geometry("800x600")
+
+        text_frame = tb.Frame(guide_window)
+        text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Segoe UI", 10))
+        scrollbar = tb.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=text_widget.yview
+        )
+        text_widget.configure(yscrollcommand=scrollbar.set)
+
+        text_widget.pack(side=tk.LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        guide_text = f"""
+{APP_NAME} User Guide
+{"=" * 50}
+
+OVERVIEW
+--------
+{APP_NAME} is a professional IoT sensor data visualization and analysis platform. 
+It provides real-time data collection, visualization, and advanced statistical analysis capabilities.
+
+GETTING STARTED
+---------------
+1. Connect your Arduino or microcontroller to your computer via USB
+2. Go to the Dashboard tab and click "Refresh Ports"
+3. Select your device's COM port from the dropdown
+4. Click "Connect" to establish communication
+5. Your sensor data will appear in real-time
+
+TABS OVERVIEW
+-------------
+• Dashboard: Real-time sensor data visualization with meters and graphs
+• Sensors: Individual sensor monitoring with detailed plots
+• Data: Data logging, export, and statistical analysis tools
+• AI Assistant: AI-powered data analysis and insights
+• About: Application information and system details
+
+DATA RECORDING
+--------------
+1. Go to the Data tab
+2. Click "Start Recording" to begin logging data
+3. Choose a location to save your CSV file
+4. Data will be automatically logged as it's received
+5. Click "Stop Recording" when finished
+
+STATISTICAL ANALYSIS
+-------------------
+The Data tab includes powerful analysis tools:
+• Calculate Statistics: Basic statistical metrics
+• Generate Report: Comprehensive data reports
+• Plot Trends: Visual trend analysis
+• Advanced Analysis: Professional statistical analysis with distributions and correlations
+• Export CSV: Filtered data export
+
+AI ASSISTANT
+------------
+The AI Assistant can help with:
+• Data interpretation and insights
+• Sensor troubleshooting
+• Statistical analysis explanations
+• General questions about IoT and sensors
+
+KEYBOARD SHORTCUTS
+------------------
+• Ctrl+O: Open/Import data
+• Ctrl+S: Save/Export data
+• Ctrl+R: Refresh ports
+• Ctrl+E: Export all data
+• F1: Show this help
+• F11: Toggle fullscreen
+
+TROUBLESHOOTING
+---------------
+• If no data appears, check your serial connection
+• Ensure your Arduino code matches the expected format
+• Try different baud rates (9600, 115200)
+• Check the Logs for detailed error information
+
+SUPPORT
+-------
+For technical support, visit: {APP_WEBSITE}
+"""
+
+        text_widget.insert(tk.END, guide_text)
+        text_widget.config(state=tk.DISABLED)
+
+    def show_shortcuts(self):
+        """Show keyboard shortcuts."""
+        shortcuts_window = tk.Toplevel(self)
+        shortcuts_window.title("Keyboard Shortcuts")
+        shortcuts_window.geometry("500x400")
+
+        text_frame = tb.Frame(shortcuts_window)
+        text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 10))
+        text_widget.pack(fill=BOTH, expand=True)
+
+        shortcuts_text = """
+KEYBOARD SHORTCUTS
+==================
+
+File Operations:
+  Ctrl+O          Open/Import data file
+  Ctrl+S          Save/Export data
+  Ctrl+E          Export all data
+  Ctrl+Q          Quit application
+
+Data Operations:
+  Ctrl+R          Refresh serial ports
+  Ctrl+C          Clear all data
+  Ctrl+T          Toggle recording
+  F5              Refresh data display
+
+Navigation:
+  Ctrl+1          Go to Dashboard tab
+  Ctrl+2          Go to Sensors tab
+  Ctrl+3          Go to Data tab
+  Ctrl+4          Go to AI Assistant tab
+  Ctrl+5          Go to About tab
+
+Analysis:
+  Ctrl+Shift+S    Calculate statistics
+  Ctrl+Shift+R    Generate report
+  Ctrl+Shift+P    Plot trends
+  Ctrl+Shift+A    Advanced analysis
+
+Help:
+  F1              Show user guide
+  F2              Show keyboard shortcuts
+  F11             Toggle fullscreen mode
+  Ctrl+?          Show about dialog
+
+AI Assistant:
+  Enter           Send message (when focused)
+  Ctrl+Enter      Send message (anywhere)
+  Escape          Clear input field
+"""
+
+        text_widget.insert(tk.END, shortcuts_text)
+        text_widget.config(state=tk.DISABLED)
+
+    def show_about_dialog(self):
+        """Show about dialog."""
+        about_window = tk.Toplevel(self)
+        about_window.title("About")
+        about_window.geometry("500x400")
+        about_window.resizable(False, False)
+
+        # Center the window
+        about_window.transient(self)
+        about_window.grab_set()
+
+        main_frame = tb.Frame(about_window)
+        main_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
+
+        # Logo/icon
+        logo_label = tb.Label(
+            main_frame, text="🌊", font=("Segoe UI", 48), bootstyle="info"
+        )
+        logo_label.pack(pady=(0, 20))
+
+        # App info
+        tb.Label(
+            main_frame,
+            text=APP_NAME,
+            font=("Segoe UI", 20, "bold"),
+            bootstyle="primary",
+        ).pack()
+
+        tb.Label(
+            main_frame,
+            text=f"Version {APP_VERSION}",
+            font=("Segoe UI", 12),
+            bootstyle="secondary",
+        ).pack(pady=(5, 10))
+
+        tb.Label(
+            main_frame,
+            text=APP_DESCRIPTION,
+            font=("Segoe UI", 10),
+            bootstyle="info",
+            wraplength=400,
+        ).pack(pady=(0, 20))
+
+        # Company info
+        tb.Label(
+            main_frame,
+            text=f"Developed by {APP_AUTHOR}",
+            font=("Segoe UI", 10),
+            bootstyle="warning",
+        ).pack()
+
+        tb.Label(
+            main_frame, text=APP_COPYRIGHT, font=("Segoe UI", 9), bootstyle="secondary"
+        ).pack(pady=(5, 20))
+
+        # Buttons
+        button_frame = tb.Frame(main_frame)
+        button_frame.pack()
+
+        tb.Button(
+            button_frame,
+            text="Visit Website",
+            command=lambda: webbrowser.open(APP_WEBSITE),
+            bootstyle="info-outline",
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        tb.Button(
+            button_frame,
+            text="Close",
+            command=about_window.destroy,
+            bootstyle="primary",
+        ).pack(side=tk.LEFT)
 
     def load_settings(self):
         """Load settings from settings.json file."""
         try:
             with open(self.settings_file, "r") as f:
                 settings = json.load(f)
-                # Set default values if not present
-                if "baud_rate" not in settings:
-                    settings["baud_rate"] = 9600
-                if "theme" not in settings:
-                    settings["theme"] = "superhero"
+                # Defaults
+                settings.setdefault("baud_rate", 9600)
+                settings.setdefault("theme", "superhero")
+                settings.setdefault("ai_provider", "none")  # auto|openai|gpt4all|none
+                settings.setdefault("openai_api_key", "")
                 return settings
         except:
             # Return default settings if file doesn't exist or is invalid
-            return {"baud_rate": 9600, "theme": "superhero"}
+            return {
+                "baud_rate": 9600,
+                "theme": "superhero",
+                "ai_provider": "simple",
+                "openai_api_key": "",
+            }
 
     def save_settings(self):
         """Save current settings to settings.json file."""
@@ -151,28 +523,39 @@ class SeaLinkApp(tb.Window):
     def toggle_recording(self):
         if not self.is_recording:
             import datetime
+            import os
 
             self.is_recording = True
             self.record_btn.config(text="Stop Recording", bootstyle="danger-outline")
-            self.recording_file = open(
+            os.makedirs("data", exist_ok=True)
+            filepath = os.path.join(
+                "data",
                 f"sealink_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "w",
-                newline="",
             )
+            self.recording_file = open(filepath, "w", newline="")
+            self.recording_path = filepath
             import csv
 
             self.csv_writer = csv.writer(self.recording_file)
-            self.csv_writer.writerow(
-                ["Timestamp", "Sensor", "Value1", "Value2", "Value3"]
+            # Wide header to accommodate sensors with many fields
+            header = ["Timestamp", "Sensor"] + [f"Value{i}" for i in range(1, 11)]
+            self.csv_writer.writerow(header)
+            self.show_notification(
+                f"Recording to {os.path.basename(filepath)}", style="success"
             )
-            self.show_notification("Recording started", style="success")
+            # Update status on Data tab if visible
+            if hasattr(self, "rec_status_lbl") and self.rec_status_lbl.winfo_exists():
+                self.rec_status_lbl.config(text=f"Recording to: {self.recording_path}")
         else:
             self.is_recording = False
             self.record_btn.config(text="Start Recording", bootstyle="primary-outline")
             if self.recording_file:
                 self.recording_file.close()
                 self.recording_file = None
+            self.recording_path = ""
             self.show_notification("Recording stopped", style="warning")
+            if hasattr(self, "rec_status_lbl") and self.rec_status_lbl.winfo_exists():
+                self.rec_status_lbl.config(text="Not recording")
 
     def log_data(self, sensor, values):
         import datetime
@@ -180,8 +563,35 @@ class SeaLinkApp(tb.Window):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = {"timestamp": timestamp, "sensor": sensor, "values": values}
         self.data_log.append(entry)
-        if self.is_recording and self.recording_file:
-            self.csv_writer.writerow([timestamp, sensor] + list(values)[:3])
+        # Append to Data table live if present
+        try:
+            if hasattr(self, "data_table") and self.data_table.winfo_exists():
+                vals = list(values)[:10]
+                if len(vals) < 10:
+                    vals += [""] * (10 - len(vals))
+                self.data_table.insert("", "end", values=(timestamp, sensor, *vals))
+
+                # Update data summary
+                if hasattr(self, "data_summary"):
+                    self.data_summary.config(text=f"Data Points: {len(self.data_log)}")
+        except Exception:
+            pass
+        if (
+            self.is_recording
+            and hasattr(self, "recording_path")
+            and self.recording_path
+        ):
+            row = [timestamp, sensor] + list(values)[:10]
+            if len(row) < 12:
+                row += [""] * (12 - len(row))
+            try:
+                import csv
+
+                with open(self.recording_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+            except Exception as e:
+                logger.error(f"Failed to write to recording file: {e}")
 
     def save_board_names(self):
         with open(self.board_names_file, "w") as f:
@@ -197,125 +607,37 @@ class SeaLinkApp(tb.Window):
         self.topbar.pack(side=TOP, fill=X)
         self.topbar.pack_propagate(False)
         self.topbar.configure(height=60)
-        # Hamburger icon in topbar
-        self.hamburger_icon = tb.Button(
-            self.topbar,
-            text="☰",
-            cursor="hand2",
-            bootstyle="info-outline",
-            width=3,
+        # Hamburger icon in topbar (custom canvas for high contrast)
+        self.hamburger_btn = tk.Frame(self.topbar, width=36, height=36, bg="#20CFCF")
+        self.hamburger_btn.pack_propagate(False)
+        self.hamburger_btn.pack(side=LEFT, padx=10, pady=12)
+        self.hamburger_canvas = tk.Canvas(
+            self.hamburger_btn, width=24, height=18, bg="#20CFCF", highlightthickness=0
         )
-        self.hamburger_icon.pack(side=LEFT, padx=10)
-        self.hamburger_icon.bind("<Button-1>", self.toggle_sidebar)
-        self.hamburger_icon.bind("<B1-Motion>", self.drag_sidebar)
+        self.hamburger_canvas.pack(expand=True)
+        # draw three white bars
+        self.hamburger_canvas.create_rectangle(0, 0, 24, 3, fill="white", outline="")
+        self.hamburger_canvas.create_rectangle(0, 7, 24, 10, fill="white", outline="")
+        self.hamburger_canvas.create_rectangle(0, 14, 24, 17, fill="white", outline="")
+        # click bindings
+        self.hamburger_btn.bind("<Button-1>", self.toggle_sidebar)
+        self.hamburger_canvas.bind("<Button-1>", self.toggle_sidebar)
 
-        # Sidebar overlay (hidden by default)
-        self.sidebar_expanded = False
-        self.sidebar_width = 0
-        self.sidebar_min_width = 48
-        self.sidebar_max_width = 220
-        self.sidebar = tb.Frame(
-            self.container, width=self.sidebar_min_width, bootstyle="dark"
-        )
-        self.sidebar.place(x=0, y=0, relheight=1)
-        self.sidebar.pack_propagate(False)
+        # simple hover effect
+        def _hover_in(e):
+            self.hamburger_btn.configure(bg="#1bb3b3")
+            self.hamburger_canvas.configure(bg="#1bb3b3")
 
-        # Sidebar content (hidden by default)
-        self.sidebar_content = tb.Frame(self.sidebar, bootstyle="dark")
-        self.sidebar_content.pack(pady=(10, 0), fill=Y, expand=True)
-        self.sidebar_content.pack_forget()
+        def _hover_out(e):
+            self.hamburger_btn.configure(bg="#20CFCF")
+            self.hamburger_canvas.configure(bg="#20CFCF")
 
-        # Close button for sidebar (hidden by default)
-        self.close_sidebar_btn = tb.Button(
-            self.sidebar_content,
-            text="✕",
-            cursor="hand2",
-            bootstyle="danger-outline",
-            width=3,
-            command=self.toggle_sidebar,
-        )
-        self.close_sidebar_btn.pack(anchor="ne", padx=10, pady=5)  # Top-right corner
-        self.close_sidebar_btn.pack_forget()  # Hide initially
-
-        # Logo and app name
-        logo_frame = tb.Frame(self.sidebar_content, bootstyle="dark")
-        logo_frame.pack(pady=(10, 10))
-        logo_img = Image.open("Sealielogo.png")
-        logo_img = logo_img.resize((48, 48), Image.LANCZOS)
-        self.logo_photo = ImageTk.PhotoImage(logo_img)
-        logo_label = tk.Label(logo_frame, image=self.logo_photo)
-        logo_label.pack()
-        app_name = tb.Label(
-            logo_frame,
-            text="SeaLink",
-            font=("Segoe UI", 18, "bold"),
-        )
-        app_name.pack()
-        # Navigation buttons
-        self.nav_dashboard = tb.Button(
-            self.sidebar_content,
-            text="Dashboard",
-            command=lambda: self.show_tab(0),
-            bootstyle="dark",
-        )
-        self.nav_dashboard.pack(fill=X, pady=(30, 10), padx=20)
-        self.add_hover(self.nav_dashboard)
-        self.create_tooltip(self.nav_dashboard, "Show dashboard overview")
-        self.nav_sensors = tb.Button(
-            self.sidebar_content,
-            text="Sensors",
-            command=lambda: self.show_tab(1),
-            bootstyle="dark",
-        )
-        self.nav_sensors.pack(fill=X, pady=10, padx=20)
-        self.add_hover(self.nav_sensors)
-        self.create_tooltip(self.nav_sensors, "View and manage sensors")
-        self.nav_data = tb.Button(
-            self.sidebar_content,
-            text="Data",
-            command=lambda: self.show_tab(2),
-            bootstyle="dark",
-        )
-        self.nav_data.pack(fill=X, pady=10, padx=20)
-        self.add_hover(self.nav_data)
-        self.create_tooltip(self.nav_data, "View and export sensor data")
-        tb.Label(self.sidebar_content, text="").pack(expand=True, fill=Y)
-        self.nav_settings = tb.Button(
-            self.sidebar_content,
-            text="Settings",
-            command=self.show_settings,
-            bootstyle="dark",
-        )
-        self.nav_settings.pack(fill=X, pady=5, padx=20)
-        self.add_hover(self.nav_settings)
-        self.create_tooltip(self.nav_settings, "Open settings dialog")
-        self.nav_about = tb.Button(
-            self.sidebar_content,
-            text="About",
-            command=lambda: self.show_tab(4),
-            bootstyle="dark",
-        )
-        self.nav_about.pack(fill=X, pady=(0, 30), padx=20)
-        self.add_hover(self.nav_about)
-        self.create_tooltip(self.nav_about, "Show about info")
-
-        # Status and quick actions (rest of topbar)
-        self.status_lbl = tb.Label(
-            self.topbar,
-            text="Disconnected",
-            bootstyle="warning",
-            font=("Segoe UI", 11, "bold"),
-        )
-        self.status_lbl.pack(side=RIGHT, padx=20)
-        self.theme_btn = tb.Button(
-            self.topbar,
-            text="Night/Day Mode",
-            command=self.toggle_theme,
-            bootstyle="info-outline",
-        )
-        self.theme_btn.pack(side=RIGHT, padx=10)
-        self.add_hover(self.theme_btn)
-        self.create_tooltip(self.theme_btn, "Switch between night and day mode")
+        self.hamburger_btn.bind("<Enter>", _hover_in)
+        self.hamburger_btn.bind("<Leave>", _hover_out)
+        self.hamburger_canvas.bind("<Enter>", _hover_in)
+        self.hamburger_canvas.bind("<Leave>", _hover_out)
+        self.add_hover(self.hamburger_btn)
+        self.create_tooltip(self.hamburger_btn, "Toggle sidebar")
         self.export_btn = tb.Button(
             self.topbar,
             text="Export CSV",
@@ -380,6 +702,24 @@ class SeaLinkApp(tb.Window):
         self.add_hover(self.record_btn)
         self.create_tooltip(self.record_btn, "Start/Stop data recording")
 
+        # AI status label (right side)
+        self.ai_status_lbl = tb.Label(
+            self.topbar,
+            text="AI: Initializing...",
+            bootstyle="info",
+            font=("Segoe UI", 9),
+        )
+        self.ai_status_lbl.pack(side=RIGHT, padx=10)
+
+        # Connection status label (right side)
+        self.status_lbl = tb.Label(
+            self.topbar,
+            text="Disconnected",
+            bootstyle="warning",
+            font=("Segoe UI", 11, "bold"),
+        )
+        self.status_lbl.pack(side=RIGHT, padx=20)
+
         # Main content area (cards)
         self.content = tb.Frame(self.container)  # removed bg argument
         self.content.pack(side=LEFT, fill=BOTH, expand=True)
@@ -408,6 +748,11 @@ class SeaLinkApp(tb.Window):
         self.build_settings_tab()
         self.build_about_tab()
         self.show_tab(0)
+
+        # Sidebar (classic packed)
+        self.sidebar = tb.Frame(self.container, width=180, bootstyle="dark")
+        self.sidebar.pack(side=LEFT, fill=Y)
+        self.sidebar.pack_propagate(False)
 
     def add_hover(self, widget):
         def on_enter(e):
@@ -459,29 +804,44 @@ class SeaLinkApp(tb.Window):
         c = self.colors["night" if self.night_mode else "day"]
         # Set background for main window (classic Tk root)
         self.configure(bg=c["bg"])
-        # Only set bg/fg for classic Tk widgets in sidebar
-        for w in self.sidebar.winfo_children():
-            if isinstance(w, tk.Frame) or isinstance(w, tk.Label):
-                try:
-                    w.configure(bg=c["sidebar"], fg=c["fg"])
-                except:
-                    pass
-        # Use bootstyle for ttkbootstrap widgets
-        self.sidebar.configure(bootstyle="dark" if self.night_mode else "warning")
-        self.topbar.configure(bootstyle="dark" if self.night_mode else "warning")
-        # self.content.configure(bg=c['bg'])  # Removed: tb.Frame does not support bg
-        for tab in self.tabs:
-            # tab.configure(bg=c['card'])  # Removed: tb.Frame does not support bg
-            pass
+        # Guard: layout may not be built yet
+        if hasattr(self, "sidebar") and self.sidebar is not None:
+            # Only set bg/fg for classic Tk widgets in sidebar
+            try:
+                for w in self.sidebar.winfo_children():
+                    if isinstance(w, tk.Frame) or isinstance(w, tk.Label):
+                        try:
+                            w.configure(bg=c["sidebar"], fg=c["fg"])
+                        except:
+                            pass
+            except Exception:
+                pass
+            # Use bootstyle for ttkbootstrap widgets
+            try:
+                self.sidebar.configure(
+                    bootstyle="dark" if self.night_mode else "warning"
+                )
+            except Exception:
+                pass
+        if hasattr(self, "topbar") and self.topbar is not None:
+            try:
+                self.topbar.configure(
+                    bootstyle="dark" if self.night_mode else "warning"
+                )
+            except Exception:
+                pass
         # Update plot backgrounds if needed
-        if hasattr(self, "fig"):
-            self.fig.patch.set_facecolor(c["card"])
-            self.ax1.set_facecolor(c["card"])
-            self.ax2.set_facecolor(c["card"])
-            self.canvas.draw()
-        if hasattr(self, "ax3d"):
-            self.ax3d.set_facecolor(c["card"])
-            self.canvas3d.draw()
+        try:
+            if hasattr(self, "fig") and hasattr(self, "ax1"):
+                self.fig.patch.set_facecolor(c["card"])
+                self.ax1.set_facecolor(c["card"])
+                if hasattr(self, "canvas"):
+                    self.canvas.draw()
+            if hasattr(self, "ax3d") and hasattr(self, "canvas3d"):
+                self.ax3d.set_facecolor(c["card"])
+                self.canvas3d.draw()
+        except Exception:
+            pass
 
     def toggle_theme(self):
         """
@@ -798,9 +1158,34 @@ class SeaLinkApp(tb.Window):
                     continue
                 no_data_counter = 0
                 self.log_serial_debug(line)
-                print(f"[SERIAL] {line}")  # Print every received line to the console
+                print(f"[SERIAL] {line}")
 
-                # Try to parse known formats
+                # AS7341 multi-line aggregator
+                if self._try_parse_as7341(line):
+                    continue
+
+                # CSV-like sensor line (e.g., 'MPU6050,3.2,1.0')
+                if self._parse_csv_sensor_line(line):
+                    continue
+
+                # Template-first parsing for selected sensors
+                parsed_any = False
+                for sensor in list(self.active_sensors):
+                    rx = sensor.get("_compiled")
+                    if not rx:
+                        continue
+                    m = rx.match(line)
+                    if not m:
+                        continue
+                    data = m.groupdict()
+                    self._ingest_template_sensor(sensor, data)
+                    parsed_any = True
+                    break
+                if parsed_any:
+                    continue
+
+                # Legacy formats fallback (DHT/IMU)
+                # ... existing legacy parsing remains unchanged ...
                 if line.startswith("YAW"):
                     try:
                         parts = line.replace(",", " ").split()
@@ -971,28 +1356,12 @@ class SeaLinkApp(tb.Window):
                 self.canvas.draw()
 
     def update_all_meters(self):
-        """Update all meters and graphs with current sensor data."""
-        # Update dashboard meters if they exist
-        if hasattr(self, "dashboard_meters"):
-            for meter in self.dashboard_meters:
-                try:
-                    meter.destroy()
-                except:
-                    pass
-
-        # Update sensor tab meters if they exist
-        if hasattr(self, "sensor_meters"):
-            for meter in self.sensor_meters:
-                try:
-                    meter.destroy()
-                except:
-                    pass
-
-        # Rebuild dashboard and sensors tab to show updated data
-        if hasattr(self, "tab_dashboard"):
-            self.build_dashboard()
-        if hasattr(self, "tab_sensors"):
-            self.build_sensors_tab()
+        """Update lightweight UI (quick stats) without rebuilding full views to avoid flashing."""
+        try:
+            if hasattr(self, "quick_stats"):
+                self.quick_stats.config(text=self.get_quick_stats())
+        except Exception:
+            pass
 
     def build_sensors_tab(self):
         for w in self.tab_sensors.winfo_children():
@@ -1001,44 +1370,61 @@ class SeaLinkApp(tb.Window):
             pady=20
         )
         sensors_frame = tb.Frame(self.tab_sensors)
-        sensors_frame.pack(pady=10)
-        # Show all active sensors
+        sensors_frame.pack(pady=10, fill=BOTH, expand=True)
+        # Grid layout: 2 columns
+        row = 0
+        col = 0
         for sensor in self.active_sensors:
-            self.build_sensor_card(sensors_frame, sensor)
-        # Add sensor section (button only, uses dialog)
-        add_frame = tb.Frame(self.tab_sensors)
-        add_frame.pack(pady=20)
-        tb.Button(
-            add_frame,
-            text="Add Sensor",
-            command=self.open_add_sensor_dialog,
-            bootstyle="primary-outline",
-        ).pack(side=LEFT, padx=5)
+            holder = tb.Frame(sensors_frame)
+            holder.grid(row=row, column=col, padx=10, pady=10, sticky="n")
+            self.build_sensor_card(holder, sensor)
+            col += 1
+            if col >= 2:
+                col = 0
+                row += 1
+
+    def request_sensors_refresh(self):
+        if self._sensors_refresh_pending:
+            return
+        self._sensors_refresh_pending = True
+        self.after(250, self._do_sensors_refresh)
+
+    def _do_sensors_refresh(self):
+        self._sensors_refresh_pending = False
+        try:
+            self.build_sensors_tab()
+        except Exception:
+            pass
 
     def build_sensor_card(self, parent, sensor):
-        card = tb.Frame(parent, bootstyle="secondary", borderwidth=2, relief="ridge")
-        card.pack(pady=10, padx=10, fill=X)
-        # Sensor header row
-        header_row = tb.Frame(card)
-        header_row.pack(fill=X, pady=(10, 0))
+        # Enhanced card styling with modern look
+        card = tb.Frame(parent, bootstyle="secondary", borderwidth=1, relief="solid")
+        card.pack(pady=15, padx=15, fill=X)
+
+        # Add subtle shadow effect through padding
+        shadow_frame = tb.Frame(card, bootstyle="dark")
+        shadow_frame.pack(fill=BOTH, expand=True, padx=2, pady=2)
+        header_row = tb.Frame(shadow_frame)
+        header_row.pack(fill=X, pady=(15, 10), padx=15)
         tb.Label(
             header_row,
             text=f"{sensor['icon']} {sensor['name']}",
-            font=("Segoe UI", 14, "bold"),
-        ).pack(side=LEFT, padx=10)
+            font=("Segoe UI", 16, "bold"),
+            bootstyle="primary",
+        ).pack(side=LEFT)
         status = "Connected" if self.is_connected else "Not Connected"
         tb.Label(
             header_row,
             text=status,
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             bootstyle="success" if self.is_connected else "danger",
-        ).pack(side=LEFT, padx=10)
+        ).pack(side=LEFT, padx=(20, 0))
         tb.Button(
             header_row,
             text="Configure",
             command=lambda s=sensor: self.configure_sensor(s),
-            bootstyle="info-outline",
-        ).pack(side=RIGHT, padx=5)
+            bootstyle="primary-outline",
+        ).pack(side=RIGHT)
         tb.Button(
             header_row,
             text="Remove",
@@ -1046,21 +1432,22 @@ class SeaLinkApp(tb.Window):
             bootstyle="danger-outline",
         ).pack(side=RIGHT, padx=5)
         # Live data/graph and meters
-        if sensor["type"] == "DHT":
-            # Add meters for temp/humidity
+        s_type = sensor.get("type", "").upper()
+        s_name = sensor.get("name", s_type)
+        if s_type in ("DHT", "DHT11", "DHT22"):
             temp_val = self.temp_data[-1] if self.temp_data else 0
             hum_val = self.hum_data[-1] if self.hum_data else 0
-            meter_row = tb.Frame(card)
-            meter_row.pack(pady=5)
+            meter_row = tb.Frame(shadow_frame)
+            meter_row.pack(pady=10, padx=15)
             tb.Meter(
                 meter_row,
                 amountused=temp_val,
                 metertype="full",
                 subtext="Temp (°C)",
-                bootstyle="info",
+                bootstyle="danger",
                 stripethickness=6,
                 interactive=False,
-                amounttotal=50,
+                amounttotal=60,
                 textfont=("Segoe UI", 10, "bold"),
                 subtextfont=("Segoe UI", 9),
                 metersize=90,
@@ -1070,7 +1457,7 @@ class SeaLinkApp(tb.Window):
                 amountused=hum_val,
                 metertype="full",
                 subtext="Humidity (%)",
-                bootstyle="success",
+                bootstyle="info",
                 stripethickness=6,
                 interactive=False,
                 amounttotal=100,
@@ -1079,10 +1466,10 @@ class SeaLinkApp(tb.Window):
                 metersize=90,
             ).pack(side=LEFT, padx=10)
             self.build_dht_plot(parent=card, compact=True, sensor_name=sensor["name"])
-        elif sensor["type"] == "IMU":
-            meter_row = tb.Frame(card)
-            meter_row.pack(pady=5)
-            tb.Meter(
+        elif s_type == "MPU6050":
+            meter_row = tb.Frame(shadow_frame)
+            meter_row.pack(pady=10, padx=15)
+            yaw_m = tb.Meter(
                 meter_row,
                 amountused=self.yaw,
                 metertype="full",
@@ -1094,8 +1481,9 @@ class SeaLinkApp(tb.Window):
                 textfont=("Segoe UI", 10, "bold"),
                 subtextfont=("Segoe UI", 9),
                 metersize=90,
-            ).pack(side=LEFT, padx=10)
-            tb.Meter(
+            )
+            yaw_m.pack(side=LEFT, padx=10)
+            pitch_m = tb.Meter(
                 meter_row,
                 amountused=self.pitch,
                 metertype="full",
@@ -1107,22 +1495,140 @@ class SeaLinkApp(tb.Window):
                 textfont=("Segoe UI", 10, "bold"),
                 subtextfont=("Segoe UI", 9),
                 metersize=90,
-            ).pack(side=LEFT, padx=10)
-            tb.Meter(
+            )
+            pitch_m.pack(side=LEFT, padx=10)
+            roll_m = tb.Meter(
                 meter_row,
                 amountused=self.roll,
                 metertype="full",
                 subtext="Roll (°)",
-                bootstyle="danger",
+                bootstyle="success",
                 stripethickness=6,
                 interactive=False,
                 amounttotal=180,
                 textfont=("Segoe UI", 10, "bold"),
                 subtextfont=("Segoe UI", 9),
                 metersize=90,
-            ).pack(side=LEFT, padx=10)
+            )
+            roll_m.pack(side=LEFT, padx=10)
+            self.imu_widgets[s_name] = {"yaw": yaw_m, "pitch": pitch_m, "roll": roll_m}
             self.build_3d_plot(parent=card, compact=True)
-        # Add more sensor types here
+        elif s_type == "ITG/MPU6050":
+            meter_row = tb.Frame(shadow_frame)
+            meter_row.pack(pady=10, padx=15)
+            yaw_m = tb.Meter(
+                meter_row,
+                amountused=self.yaw,
+                metertype="full",
+                subtext="Yaw (°)",
+                bootstyle="primary",
+                stripethickness=6,
+                interactive=False,
+                amounttotal=180,
+                textfont=("Segoe UI", 10, "bold"),
+                subtextfont=("Segoe UI", 9),
+                metersize=90,
+            )
+            yaw_m.pack(side=LEFT, padx=10)
+            pitch_m = tb.Meter(
+                meter_row,
+                amountused=self.pitch,
+                metertype="full",
+                subtext="Pitch (°)",
+                bootstyle="warning",
+                stripethickness=6,
+                interactive=False,
+                amounttotal=90,
+                textfont=("Segoe UI", 10, "bold"),
+                subtextfont=("Segoe UI", 9),
+                metersize=90,
+            )
+            pitch_m.pack(side=LEFT, padx=10)
+            roll_m = tb.Meter(
+                meter_row,
+                amountused=self.roll,
+                metertype="full",
+                subtext="Roll (°)",
+                bootstyle="success",
+                stripethickness=6,
+                interactive=False,
+                amounttotal=180,
+                textfont=("Segoe UI", 10, "bold"),
+                subtextfont=("Segoe UI", 9),
+                metersize=90,
+            )
+            roll_m.pack(side=LEFT, padx=10)
+            self.imu_widgets[s_name] = {"yaw": yaw_m, "pitch": pitch_m, "roll": roll_m}
+            self.build_3d_plot(parent=card, compact=True)
+        elif s_type in ("BMP280", "TDS", "SOIL", "LDR", "DS18B20", "UV"):
+            # simple compact plot using generic_streams
+            stream = self.generic_streams.get(s_name, {})
+            if not stream:
+                tb.Label(card, text="No data", font=("Segoe UI", 10, "italic")).pack(
+                    pady=5
+                )
+            else:
+                fig = Figure(figsize=(3.6, 2.0), dpi=100)
+                ax = fig.add_subplot(111)
+                t = stream.get("time", [])
+                for f in sensor.get("fields", []):
+                    ax.plot(
+                        t, stream.get(f, []), label=sensor.get("_labels", {}).get(f, f)
+                    )
+                ax.set_xlabel("Time (s)")
+                ax.set_ylabel("Value")
+                ax.legend(fontsize=8, frameon=True)
+                ax.grid(True, linestyle="--", alpha=0.4)
+                fig.tight_layout(pad=1.2)
+                canvas = FigureCanvasTkAgg(fig, master=card)
+                canvas.get_tk_widget().pack(padx=10, pady=10)
+        elif s_type == "AS7341":
+            # Build bar chart for spectrometer
+            state = self.as7341_state.setdefault(
+                s_name, {"baseline": {}, "smoothed": [0.0] * 10}
+            )
+            fig = Figure(figsize=(5, 2.4), dpi=100)
+            ax = fig.add_subplot(111)
+            wavelengths = ["415", "445", "480", "515", "555", "590", "630", "680"]
+            bars = ax.bar(wavelengths, [0] * 8, color="#20CFCF")
+            ax.set_ylim(0, 1.2)
+            ax.set_ylabel("Normalized Intensity")
+            ax.set_xlabel("Wavelength (nm)")
+            ax.grid(True, linestyle="--", alpha=0.4)
+            fig.tight_layout(pad=1.0)
+            canvas = FigureCanvasTkAgg(fig, master=shadow_frame)
+            canvas.get_tk_widget().pack(padx=15, pady=10)
+            state["bars"] = list(bars)
+            state["canvas"] = canvas
+
+            # Controls
+            def calibrate_dark():
+                # Use last seen raw values as baseline if available
+                buf = self._as7341_buf.get("data", {})
+                if buf:
+                    state["baseline"] = {
+                        k: float(buf.get(k, 0.0))
+                        for k in [
+                            "F1",
+                            "F2",
+                            "F3",
+                            "F4",
+                            "F5",
+                            "F6",
+                            "F7",
+                            "F8",
+                            "CLEAR",
+                            "NIR",
+                        ]
+                    }
+
+            tb.Button(
+                shadow_frame,
+                text="Calibrate (Dark)",
+                command=calibrate_dark,
+                bootstyle="secondary",
+            ).pack(pady=10, padx=15)
+        # else: future sensor types
 
     def build_dht_plot(self, parent=None, compact=False, sensor_name=None):
         import matplotlib
@@ -1210,20 +1716,20 @@ class SeaLinkApp(tb.Window):
             elif show_hum and not show_temp:
                 self.ax1.set_ylabel("Humidity (%)", fontweight="bold")
                 self.ax1.set_ylim(*hum_ylim)
-            else:
-                self.ax1.set_ylabel("Value", fontweight="bold")
-                self.ax1.set_ylim(
-                    min(temp_ylim[0], hum_ylim[0]), max(temp_ylim[1], hum_ylim[1])
-                )
-            self.ax1.legend(
-                lines,
-                labels,
-                loc="upper right",
-                frameon=True,
-                fancybox=True,
-                borderpad=1,
-            )
         else:
+            self.ax1.set_ylabel("Value", fontweight="bold")
+            self.ax1.set_ylim(
+                min(temp_ylim[0], hum_ylim[0]), max(temp_ylim[1], hum_ylim[1])
+            )
+        self.ax1.legend(
+            lines,
+            labels,
+            loc="upper right",
+            frameon=True,
+            fancybox=True,
+            borderpad=1,
+        )
+        if not self.is_connected or not self.time_data:
             self.ax1.set_title("No data", fontweight="bold")
         # Set the plot title to the sensor's name if provided
         if sensor_name:
@@ -1383,23 +1889,99 @@ class SeaLinkApp(tb.Window):
             print(f"[ERROR] 3D orientation update failed: {e}")
 
     def schedule_simulation(self):
-        # Only update plots if connected; do not simulate data
+        # Avoid extra UI refresh when connected; rely on data-driven updates
         if self.is_connected:
+            self.after_job = self.after(1000, self.schedule_simulation)
+            return
+            # If not connected, keep plots alive but minimal
             self.update_dht_plot()
         self.after_job = self.after(1000, self.schedule_simulation)
+
+    def _load_templates_if_needed(self):
+        if self._template_cache is None:
+            try:
+                with open("sensor_templates.json", "r") as f:
+                    templates = json.load(f)
+                # precompile
+                for t in templates:
+                    rx = t.get("parser", {}).get("regex", "")
+                    t["_compiled"] = re.compile(rx) if rx else None
+                # map by type
+                self._template_cache = {t["type"].upper(): t for t in templates}
+            except Exception:
+                self._template_cache = {}
+        return self._template_cache
+
+    def _get_template_by_type(self, type_str):
+        cache = self._load_templates_if_needed()
+        return cache.get(type_str.upper())
 
     def open_add_sensor_dialog(self):
         # Dialog for adding a sensor
         popup = tk.Toplevel(self)
         popup.title("Add Sensor")
         popup.geometry("350x260")
-        popup.title("AI Analysis Result")
-        img = Image.open(img_path)
-        img = img.resize((400, 300), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
-        label = tk.Label(popup, image=photo)
-        label.image = photo
-        label.pack()
+        popup.resizable(False, False)
+        tb.Label(
+            popup, text="Add Sensor", font=("Segoe UI", 14, "bold"), bootstyle="info"
+        ).pack(pady=10)
+        tb.Label(popup, text="Type:").pack()
+        # Load types from templates lazily
+        tpl = self._load_templates_if_needed()
+        type_var = tk.StringVar(value=(list(tpl.keys())[0] if tpl else "DHT11"))
+        type_menu = tb.Combobox(
+            popup,
+            textvariable=type_var,
+            values=list(tpl.keys()) if tpl else ["DHT11", "MPU6050"],
+            state="readonly",
+        )
+        type_menu.pack(pady=2)
+        tb.Label(popup, text="Name:").pack()
+        name_var = tk.StringVar()
+        name_entry = tb.Entry(popup, textvariable=name_var)
+        name_entry.pack(pady=2)
+        name_entry.focus()
+        tb.Label(popup, text="Port:").pack()
+        port_var = tk.StringVar()
+        port_menu = tb.Combobox(
+            popup,
+            textvariable=port_var,
+            values=[p.device for p in serial.tools.list_ports.comports()],
+            state="readonly",
+        )
+        port_menu.pack(pady=2)
+        btn_frame = tb.Frame(popup)
+        btn_frame.pack(side="bottom", fill=X, pady=15)
+
+        def add():
+            s_type = type_var.get().strip()
+            s_name = name_var.get().strip() or s_type
+            s_port = port_var.get().strip()
+            t = self._get_template_by_type(s_type) or {}
+            self.active_sensors.append(
+                {
+                    "type": s_type,
+                    "name": s_name,
+                    "port": s_port,
+                    "icon": t.get("icon", "🧩"),
+                    "fields": t.get("fields", []),
+                    "graph": t.get("graph_type", "single-line"),
+                    "_compiled": t.get("_compiled"),
+                    "_labels": t.get("labels", {}),
+                    "_ranges": t.get("ranges", {}),
+                }
+            )
+            # init stream buffers for non-DHT/IMU
+            if s_name not in self.generic_streams:
+                self.generic_streams[s_name] = {"time": []}
+                for f in t.get("fields", []):
+                    self.generic_streams[s_name][f] = []
+            self.build_sensors_tab()
+            popup.destroy()
+
+        tb.Button(btn_frame, text="Save", command=add, bootstyle="success").pack(
+            side=LEFT, padx=5
+        )
 
     def build_settings_tab(self):
         for w in self.tab_settings.winfo_children():
@@ -1489,19 +2071,340 @@ class SeaLinkApp(tb.Window):
     def build_about_tab(self):
         for w in self.tab_about.winfo_children():
             w.destroy()
+
+        # Main container with scrollable content
+        main_frame = tb.Frame(self.tab_about)
+        main_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
+
+        # Application header
+        header_frame = tb.Frame(main_frame)
+        header_frame.pack(fill=X, pady=(0, 20))
+
+        # App logo/icon area
+        logo_frame = tb.Frame(header_frame)
+        logo_frame.pack(side=LEFT, padx=(0, 20))
+
+        # Create a simple logo placeholder
+        logo_label = tb.Label(
+            logo_frame, text="🌊", font=("Segoe UI", 48), bootstyle="info"
+        )
+        logo_label.pack()
+
+        # App info
+        info_frame = tb.Frame(header_frame)
+        info_frame.pack(side=LEFT, fill=BOTH, expand=True)
+
         tb.Label(
-            self.tab_about,
-            text="About SeaLink Dashboard\nVersion 1.0\nA professional dashboard for sensor data visualization.",
+            info_frame,
+            text=APP_NAME,
+            font=("Segoe UI", 24, "bold"),
+            bootstyle="primary",
+        ).pack(anchor="w")
+
+        tb.Label(
+            info_frame,
+            text=f"Version {APP_VERSION}",
             font=("Segoe UI", 14),
-        ).pack(pady=30)
+            bootstyle="secondary",
+        ).pack(anchor="w", pady=(5, 0))
+
+        tb.Label(
+            info_frame, text=APP_DESCRIPTION, font=("Segoe UI", 12), bootstyle="info"
+        ).pack(anchor="w", pady=(10, 0))
+
+        # Features section
+        features_frame = tb.LabelFrame(
+            main_frame, text="Key Features", bootstyle="info"
+        )
+        features_frame.pack(fill=X, pady=(0, 20))
+
+        features = [
+            "🔌 Real-time Serial Communication with Arduino/microcontrollers",
+            "📊 Advanced Data Visualization with Interactive Charts",
+            "🤖 AI-Powered Data Analysis with GPT4All Integration",
+            "📈 Professional Statistical Analysis Tools",
+            "💾 Data Export and Reporting Capabilities",
+            "🎨 Modern, Professional User Interface",
+            "⚡ High-Performance Real-time Processing",
+            "🔧 Comprehensive Sensor Support (DHT, MPU6050, TDS, AS7341, etc.)",
+        ]
+
+        for feature in features:
+            tb.Label(
+                features_frame,
+                text=feature,
+                font=("Segoe UI", 10),
+                bootstyle="secondary",
+            ).pack(anchor="w", padx=10, pady=2)
+
+        # Technical info
+        tech_frame = tb.LabelFrame(
+            main_frame, text="Technical Information", bootstyle="success"
+        )
+        tech_frame.pack(fill=X, pady=(0, 20))
+
+        tech_info = [
+            f"Python Version: {sys.version.split()[0]}",
+            f"Platform: {sys.platform}",
+            f"Architecture: {sys.maxsize > 2**32 and '64-bit' or '32-bit'}",
+            f"Build Date: {datetime.now().strftime('%Y-%m-%d')}",
+            f"AI Support: {'Enabled' if GPT4ALL_AVAILABLE else 'Disabled'}",
+        ]
+
+        for info in tech_info:
+            tb.Label(
+                tech_frame, text=info, font=("Consolas", 9), bootstyle="secondary"
+            ).pack(anchor="w", padx=10, pady=1)
+
+        # Company info
+        company_frame = tb.LabelFrame(
+            main_frame, text="Company Information", bootstyle="warning"
+        )
+        company_frame.pack(fill=X, pady=(0, 20))
+
+        tb.Label(
+            company_frame,
+            text=f"Developed by {APP_AUTHOR}",
+            font=("Segoe UI", 12, "bold"),
+            bootstyle="warning",
+        ).pack(anchor="w", padx=10, pady=5)
+
+        tb.Label(
+            company_frame,
+            text=APP_COPYRIGHT,
+            font=("Segoe UI", 10),
+            bootstyle="secondary",
+        ).pack(anchor="w", padx=10, pady=2)
+
+        # Action buttons
+        button_frame = tb.Frame(main_frame)
+        button_frame.pack(fill=X, pady=(0, 20))
+
+        tb.Button(
+            button_frame,
+            text="Visit Website",
+            command=lambda: webbrowser.open(APP_WEBSITE),
+            bootstyle="info-outline",
+        ).pack(side=LEFT, padx=(0, 10))
+
+        tb.Button(
+            button_frame,
+            text="View Logs",
+            command=self.show_logs,
+            bootstyle="secondary-outline",
+        ).pack(side=LEFT, padx=(0, 10))
+
+        tb.Button(
+            button_frame,
+            text="System Info",
+            command=self.show_system_info,
+            bootstyle="success-outline",
+        ).pack(side=LEFT)
+
+        # License info
+        license_frame = tb.Frame(main_frame)
+        license_frame.pack(fill=X)
+
+        tb.Label(
+            license_frame,
+            text="This software is provided as-is for educational and professional use.\nPlease refer to the license agreement for terms and conditions.",
+            font=("Segoe UI", 9),
+            bootstyle="secondary",
+            justify="center",
+        ).pack()
+
+    def show_logs(self):
+        """Show application logs in a new window."""
+        log_window = tk.Toplevel(self)
+        log_window.title("Application Logs")
+        log_window.geometry("800x600")
+
+        # Create text widget with scrollbar
+        text_frame = tb.Frame(log_window)
+        text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 9))
+        scrollbar = tb.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=text_widget.yview
+        )
+        text_widget.configure(yscrollcommand=scrollbar.set)
+
+        text_widget.pack(side=tk.LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Read and display log file
+        try:
+            if os.path.exists("sealink.log"):
+                with open("sealink.log", "r", encoding="utf-8") as f:
+                    log_content = f.read()
+                    text_widget.insert(tk.END, log_content)
+            else:
+                text_widget.insert(
+                    tk.END,
+                    "No log file found. Logs will appear here as the application runs.",
+                )
+        except Exception as e:
+            text_widget.insert(tk.END, f"Error reading log file: {e}")
+
+        text_widget.config(state=tk.DISABLED)
+
+        # Add refresh button
+        button_frame = tb.Frame(log_window)
+        button_frame.pack(fill=X, padx=10, pady=(0, 10))
+
+        tb.Button(
+            button_frame,
+            text="Refresh",
+            command=lambda: self.refresh_logs(text_widget),
+            bootstyle="info-outline",
+        ).pack(side=tk.LEFT)
+
+        tb.Button(
+            button_frame,
+            text="Clear Logs",
+            command=lambda: self.clear_logs(text_widget),
+            bootstyle="danger-outline",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tb.Button(
+            button_frame,
+            text="Export Logs",
+            command=lambda: self.export_logs(),
+            bootstyle="success-outline",
+        ).pack(side=tk.RIGHT)
+
+    def refresh_logs(self, text_widget):
+        """Refresh the log display."""
+        text_widget.config(state=tk.NORMAL)
+        text_widget.delete(1.0, tk.END)
+
+        try:
+            if os.path.exists("sealink.log"):
+                with open("sealink.log", "r", encoding="utf-8") as f:
+                    log_content = f.read()
+                    text_widget.insert(tk.END, log_content)
+            else:
+                text_widget.insert(tk.END, "No log file found.")
+        except Exception as e:
+            text_widget.insert(tk.END, f"Error reading log file: {e}")
+
+        text_widget.config(state=tk.DISABLED)
+        text_widget.see(tk.END)
+
+    def clear_logs(self, text_widget):
+        """Clear the log file and display."""
+        if messagebox.askyesno(
+            "Clear Logs", "Are you sure you want to clear all logs?"
+        ):
+            try:
+                with open("sealink.log", "w", encoding="utf-8") as f:
+                    f.write("")
+                text_widget.config(state=tk.NORMAL)
+                text_widget.delete(1.0, tk.END)
+                text_widget.insert(tk.END, "Logs cleared.")
+                text_widget.config(state=tk.DISABLED)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to clear logs: {e}")
+
+    def export_logs(self):
+        """Export logs to a file."""
+        from tkinter import filedialog
+
+        file = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt")],
+            title="Export Logs",
+        )
+        if file:
+            try:
+                if os.path.exists("sealink.log"):
+                    import shutil
+
+                    shutil.copy("sealink.log", file)
+                    messagebox.showinfo("Success", f"Logs exported to {file}")
+                else:
+                    messagebox.showwarning("Warning", "No log file found to export.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export logs: {e}")
+
+    def show_system_info(self):
+        """Show detailed system information."""
+        info_window = tk.Toplevel(self)
+        info_window.title("System Information")
+        info_window.geometry("600x500")
+
+        # Create text widget with scrollbar
+        text_frame = tb.Frame(info_window)
+        text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 9))
+        scrollbar = tb.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=text_widget.yview
+        )
+        text_widget.configure(yscrollcommand=scrollbar.set)
+
+        text_widget.pack(side=tk.LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Gather system information
+        import platform
+        import psutil
+
+        system_info = f"""
+SYSTEM INFORMATION
+{"=" * 50}
+
+Application:
+  Name: {APP_NAME}
+  Version: {APP_VERSION}
+  Build Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+Python Environment:
+  Python Version: {sys.version}
+  Python Executable: {sys.executable}
+  Platform: {sys.platform}
+  Architecture: {platform.architecture()[0]}
+
+Operating System:
+  System: {platform.system()}
+  Release: {platform.release()}
+  Version: {platform.version()}
+  Machine: {platform.machine()}
+  Processor: {platform.processor()}
+
+Hardware:
+  CPU Count: {psutil.cpu_count()}
+  CPU Usage: {psutil.cpu_percent()}%
+  Memory Total: {psutil.virtual_memory().total / (1024**3):.1f} GB
+  Memory Available: {psutil.virtual_memory().available / (1024**3):.1f} GB
+  Memory Usage: {psutil.virtual_memory().percent}%
+  Disk Usage: {psutil.disk_usage("/").percent}%
+
+Dependencies:
+  NumPy: {np.__version__}
+  Pandas: {pd.__version__}
+  Matplotlib: {plt.matplotlib.__version__}
+  Tkinter: Available
+  Serial: Available
+  GPT4All: {"Available" if GPT4ALL_AVAILABLE else "Not Available"}
+
+Application Status:
+  Serial Ports: {len(serial.tools.list_ports.comports())} available
+  AI Status: {getattr(self, "ai_mode", "Unknown")}
+  Theme: {self.settings.get("theme", "Unknown")}
+  Data Points: {len(self.data_log) if hasattr(self, "data_log") else 0}
+"""
+
+        text_widget.insert(tk.END, system_info)
+        text_widget.config(state=tk.DISABLED)
 
     def show_settings(self):
         """
-        Show the Settings dialog for theme and serial options.
+        Show the Settings dialog for theme, serial, and AI options.
         """
         settings = tk.Toplevel(self)
         settings.title("Settings")
-        settings.geometry("350x220")
+        settings.geometry("420x320")
         settings.resizable(False, False)
         tb.Label(
             settings, text="Settings", font=("Segoe UI", 14, "bold"), bootstyle="info"
@@ -1533,12 +2436,37 @@ class SeaLinkApp(tb.Window):
         )
         baud_menu.pack(side=LEFT, padx=10)
 
+        # AI Provider
+        ai_frame = tb.Frame(settings)
+        ai_frame.pack(fill=X, padx=20, pady=5)
+        tb.Label(ai_frame, text="AI Provider:").pack(side=LEFT)
+        ai_var = tk.StringVar(value=self.settings.get("ai_provider", "auto"))
+        ai_menu = tb.Combobox(
+            ai_frame,
+            textvariable=ai_var,
+            values=["auto", "openai", "gpt4all", "none"],
+            state="readonly",
+        )
+        ai_menu.pack(side=LEFT, padx=10)
+
+        # OpenAI API Key
+        key_frame = tb.Frame(settings)
+        key_frame.pack(fill=X, padx=20, pady=5)
+        tb.Label(key_frame, text="OpenAI API Key:").pack(side=LEFT)
+        key_var = tk.StringVar(value=self.settings.get("openai_api_key", ""))
+        key_entry = tb.Entry(key_frame, textvariable=key_var, show="*")
+        key_entry.pack(side=LEFT, padx=10, fill=X, expand=True)
+
         def save_settings():
             self.settings["theme"] = theme_var.get()
             self.settings["baud_rate"] = int(baud_var.get())
+            self.settings["ai_provider"] = ai_var.get()
+            self.settings["openai_api_key"] = key_var.get().strip()
             self.save_settings()
             # Apply theme immediately
             self.style.theme_use(self.settings["theme"])
+            # Re-init AI
+            self.init_ai()
             settings.destroy()
             self.status_lbl.config(text="Settings updated", bootstyle="success")
             self.after(
@@ -1599,6 +2527,639 @@ class SeaLinkApp(tb.Window):
                 )
         self.show_notification("All data exported!", style="success")
 
+    def calculate_statistics(self):
+        """Calculate statistical metrics for selected sensor data."""
+        import numpy as np
+        import pandas as pd
+        from datetime import datetime
+
+        selected_sensor = self.stats_sensor_var.get()
+
+        if not self.data_log:
+            self._update_stats_display("No data available for analysis.")
+            return
+
+        # Filter data by sensor if not "All Sensors"
+        if selected_sensor != "All Sensors":
+            filtered_data = [
+                entry for entry in self.data_log if entry["sensor"] == selected_sensor
+            ]
+        else:
+            filtered_data = self.data_log
+
+        if not filtered_data:
+            self._update_stats_display(f"No data found for sensor: {selected_sensor}")
+            return
+
+        # Convert to DataFrame for easier analysis
+        df_data = []
+        for entry in filtered_data:
+            for i, value in enumerate(entry["values"]):
+                if value is not None and value != "":
+                    df_data.append(
+                        {
+                            "timestamp": entry["timestamp"],
+                            "sensor": entry["sensor"],
+                            "value": float(value),
+                            "value_index": i,
+                        }
+                    )
+
+        if not df_data:
+            self._update_stats_display("No numeric data found for analysis.")
+            return
+
+        df = pd.DataFrame(df_data)
+
+        # Calculate statistics
+        stats_text = f"📊 STATISTICAL ANALYSIS REPORT\n"
+        stats_text += f"{'=' * 50}\n"
+        stats_text += f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        stats_text += f"Sensor: {selected_sensor}\n"
+        stats_text += f"Total Data Points: {len(df)}\n"
+        stats_text += (
+            f"Time Range: {df['timestamp'].min()} to {df['timestamp'].max()}\n\n"
+        )
+
+        # Basic statistics
+        stats_text += "📈 BASIC STATISTICS\n"
+        stats_text += f"{'─' * 30}\n"
+        stats_text += f"Mean:           {df['value'].mean():.4f}\n"
+        stats_text += f"Median:         {df['value'].median():.4f}\n"
+        stats_text += f"Standard Dev:   {df['value'].std():.4f}\n"
+        stats_text += f"Variance:       {df['value'].var():.4f}\n"
+        stats_text += f"Minimum:        {df['value'].min():.4f}\n"
+        stats_text += f"Maximum:        {df['value'].max():.4f}\n"
+        stats_text += f"Range:          {df['value'].max() - df['value'].min():.4f}\n\n"
+
+        # Percentiles
+        stats_text += "📊 PERCENTILES\n"
+        stats_text += f"{'─' * 30}\n"
+        stats_text += f"25th Percentile: {df['value'].quantile(0.25):.4f}\n"
+        stats_text += f"50th Percentile: {df['value'].quantile(0.50):.4f}\n"
+        stats_text += f"75th Percentile: {df['value'].quantile(0.75):.4f}\n"
+        stats_text += f"90th Percentile: {df['value'].quantile(0.90):.4f}\n"
+        stats_text += f"95th Percentile: {df['value'].quantile(0.95):.4f}\n\n"
+
+        # Data quality
+        stats_text += "🔍 DATA QUALITY\n"
+        stats_text += f"{'─' * 30}\n"
+        stats_text += f"Valid Values:    {len(df)}\n"
+        stats_text += f"Missing Values:  {len(filtered_data) * 10 - len(df)}\n"
+        stats_text += (
+            f"Data Completeness: {(len(df) / (len(filtered_data) * 10)) * 100:.1f}%\n\n"
+        )
+
+        # Trend analysis
+        if len(df) > 1:
+            # Simple linear trend
+            x = np.arange(len(df))
+            y = df["value"].values
+            slope, intercept = np.polyfit(x, y, 1)
+            stats_text += "📈 TREND ANALYSIS\n"
+            stats_text += f"{'─' * 30}\n"
+            stats_text += f"Linear Trend:    {slope:.6f} units/point\n"
+            stats_text += f"Trend Direction: {'Increasing' if slope > 0 else 'Decreasing' if slope < 0 else 'Stable'}\n"
+            stats_text += f"Correlation:     {np.corrcoef(x, y)[0, 1]:.4f}\n\n"
+
+        # Sensor-specific insights
+        if selected_sensor == "Temperature":
+            stats_text += "🌡️ TEMPERATURE INSIGHTS\n"
+            stats_text += f"{'─' * 30}\n"
+            if df["value"].mean() < 0:
+                stats_text += "⚠️  Below freezing point\n"
+            elif df["value"].mean() > 50:
+                stats_text += "⚠️  High temperature detected\n"
+            else:
+                stats_text += "✅ Temperature within normal range\n"
+        elif selected_sensor == "Humidity":
+            stats_text += "💧 HUMIDITY INSIGHTS\n"
+            stats_text += f"{'─' * 30}\n"
+            if df["value"].mean() < 30:
+                stats_text += "⚠️  Low humidity (dry conditions)\n"
+            elif df["value"].mean() > 70:
+                stats_text += "⚠️  High humidity (moist conditions)\n"
+            else:
+                stats_text += "✅ Humidity within comfortable range\n"
+        elif selected_sensor == "TDS":
+            stats_text += "💧 WATER QUALITY INSIGHTS\n"
+            stats_text += f"{'─' * 30}\n"
+            if df["value"].mean() < 50:
+                stats_text += "✅ Excellent water quality (low TDS)\n"
+            elif df["value"].mean() < 200:
+                stats_text += "✅ Good water quality\n"
+            elif df["value"].mean() < 500:
+                stats_text += "⚠️  Fair water quality\n"
+            else:
+                stats_text += "⚠️  Poor water quality (high TDS)\n"
+
+        self._update_stats_display(stats_text)
+
+    def generate_data_report(self):
+        """Generate a comprehensive data analysis report."""
+        import pandas as pd
+        from datetime import datetime
+        from tkinter import filedialog
+
+        if not self.data_log:
+            self.show_notification(
+                "No data available for report generation.", style="warning"
+            )
+            return
+
+        # Ask user where to save the report
+        file = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save Data Analysis Report",
+        )
+        if not file:
+            return
+
+        # Generate comprehensive report
+        report = f"SENSOR DATA ANALYSIS REPORT\n"
+        report += f"{'=' * 60}\n"
+        report += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report += f"Total Data Entries: {len(self.data_log)}\n\n"
+
+        # Sensor summary
+        sensor_counts = {}
+        for entry in self.data_log:
+            sensor = entry["sensor"]
+            sensor_counts[sensor] = sensor_counts.get(sensor, 0) + 1
+
+        report += "SENSOR SUMMARY\n"
+        report += f"{'─' * 30}\n"
+        for sensor, count in sensor_counts.items():
+            report += f"{sensor}: {count} entries\n"
+        report += "\n"
+
+        # Detailed analysis for each sensor
+        for sensor in sensor_counts.keys():
+            sensor_data = [
+                entry for entry in self.data_log if entry["sensor"] == sensor
+            ]
+            if not sensor_data:
+                continue
+
+            report += f"DETAILED ANALYSIS: {sensor}\n"
+            report += f"{'─' * 40}\n"
+
+            # Extract numeric values
+            values = []
+            for entry in sensor_data:
+                for value in entry["values"]:
+                    if value is not None and value != "":
+                        try:
+                            values.append(float(value))
+                        except:
+                            pass
+
+            if values:
+                import numpy as np
+
+                report += f"Data Points: {len(values)}\n"
+                report += f"Mean: {np.mean(values):.4f}\n"
+                report += f"Std Dev: {np.std(values):.4f}\n"
+                report += f"Min: {np.min(values):.4f}\n"
+                report += f"Max: {np.max(values):.4f}\n"
+                report += f"Range: {np.max(values) - np.min(values):.4f}\n\n"
+            else:
+                report += "No numeric data available\n\n"
+
+        # Save report with UTF-8 encoding
+        with open(file, "w", encoding="utf-8") as f:
+            f.write(report)
+
+        self.show_notification(f"Data report saved to: {file}", style="success")
+
+    def plot_data_trends(self):
+        """Create trend plots for sensor data."""
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import numpy as np
+
+            if not self.data_log:
+                self.show_notification(
+                    "No data available for plotting.", style="warning"
+                )
+                return
+
+            # Create a new window for plots
+            plot_window = tk.Toplevel(self.root)
+            plot_window.title("Sensor Data Trends")
+            plot_window.geometry("800x600")
+
+            # Get data for plotting
+            sensors = list(set(entry["sensor"] for entry in self.data_log))
+
+            # Create subplots
+            fig, axes = plt.subplots(len(sensors), 1, figsize=(10, 6 * len(sensors)))
+            if len(sensors) == 1:
+                axes = [axes]
+
+            for i, sensor in enumerate(sensors):
+                sensor_data = [
+                    entry for entry in self.data_log if entry["sensor"] == sensor
+                ]
+
+                # Extract time and values
+                times = []
+                values = []
+                for entry in sensor_data:
+                    for j, value in enumerate(entry["values"]):
+                        if value is not None and value != "":
+                            try:
+                                times.append(j)  # Use index as time proxy
+                                values.append(float(value))
+                            except:
+                                pass
+
+                if values:
+                    axes[i].plot(times, values, "b-", linewidth=2, label=sensor)
+                    axes[i].set_title(f"{sensor} Trend Analysis")
+                    axes[i].set_xlabel("Data Point Index")
+                    axes[i].set_ylabel("Value")
+                    axes[i].grid(True, alpha=0.3)
+                    axes[i].legend()
+
+                    # Add trend line
+                    if len(values) > 1:
+                        z = np.polyfit(times, values, 1)
+                        p = np.poly1d(z)
+                        axes[i].plot(times, p(times), "r--", alpha=0.8, label="Trend")
+
+            plt.tight_layout()
+
+            # Embed plot in tkinter window
+            canvas = FigureCanvasTkAgg(fig, plot_window)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        except Exception as e:
+            print(f"[ERROR] Plot generation failed: {e}")
+            self.show_notification(f"Plot generation failed: {e}", style="danger")
+
+    def advanced_data_analysis(self):
+        """Perform advanced statistical analysis with visualizations."""
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import numpy as np
+            import pandas as pd
+            from scipy import stats
+
+            if not self.data_log:
+                self.show_notification(
+                    "No data available for advanced analysis.", style="warning"
+                )
+                return
+
+            # Create advanced analysis window
+            analysis_window = tk.Toplevel(self.root)
+            analysis_window.title("Advanced Data Analysis")
+            analysis_window.geometry("1200x800")
+
+            # Create notebook for different analysis types
+            notebook = tb.Notebook(analysis_window)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # 1. Distribution Analysis Tab
+            dist_frame = tb.Frame(notebook)
+            notebook.add(dist_frame, text="Distributions")
+
+            # Get all numeric data
+            all_values = []
+            sensor_values = {}
+            for entry in self.data_log:
+                sensor = entry["sensor"]
+                if sensor not in sensor_values:
+                    sensor_values[sensor] = []
+                for value in entry["values"]:
+                    if value is not None and value != "":
+                        try:
+                            val = float(value)
+                            all_values.append(val)
+                            sensor_values[sensor].append(val)
+                        except:
+                            pass
+
+            if all_values:
+                # Create distribution plots
+                fig1, axes1 = plt.subplots(2, 2, figsize=(12, 8))
+                fig1.suptitle("Data Distribution Analysis", fontsize=16)
+
+                # Histogram
+                axes1[0, 0].hist(
+                    all_values, bins=30, alpha=0.7, color="blue", edgecolor="black"
+                )
+                axes1[0, 0].set_title("Overall Data Distribution")
+                axes1[0, 0].set_xlabel("Value")
+                axes1[0, 0].set_ylabel("Frequency")
+                axes1[0, 0].grid(True, alpha=0.3)
+
+                # Box plot by sensor
+                sensor_data_for_box = [
+                    sensor_values[sensor]
+                    for sensor in sensor_values.keys()
+                    if sensor_values[sensor]
+                ]
+                sensor_names = [
+                    sensor for sensor in sensor_values.keys() if sensor_values[sensor]
+                ]
+                if sensor_data_for_box:
+                    axes1[0, 1].boxplot(sensor_data_for_box, labels=sensor_names)
+                    axes1[0, 1].set_title("Data Distribution by Sensor")
+                    axes1[0, 1].set_ylabel("Value")
+                    axes1[0, 1].tick_params(axis="x", rotation=45)
+                    axes1[0, 1].grid(True, alpha=0.3)
+
+                # Q-Q plot for normality
+                stats.probplot(all_values, dist="norm", plot=axes1[1, 0])
+                axes1[1, 0].set_title("Q-Q Plot (Normality Test)")
+                axes1[1, 0].grid(True, alpha=0.3)
+
+                # Cumulative distribution
+                sorted_values = np.sort(all_values)
+                cumulative = np.arange(1, len(sorted_values) + 1) / len(sorted_values)
+                axes1[1, 1].plot(sorted_values, cumulative, "b-", linewidth=2)
+                axes1[1, 1].set_title("Cumulative Distribution Function")
+                axes1[1, 1].set_xlabel("Value")
+                axes1[1, 1].set_ylabel("Cumulative Probability")
+                axes1[1, 1].grid(True, alpha=0.3)
+
+                plt.tight_layout()
+
+                # Embed in tkinter
+                canvas1 = FigureCanvasTkAgg(fig1, dist_frame)
+                canvas1.draw()
+                canvas1.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+            # 2. Correlation Analysis Tab
+            corr_frame = tb.Frame(notebook)
+            notebook.add(corr_frame, text="Correlations")
+
+            # Create correlation matrix
+            if len(sensor_values) > 1:
+                # Create DataFrame for correlation analysis
+                max_len = max(
+                    len(sensor_values[sensor]) for sensor in sensor_values.keys()
+                )
+                corr_data = {}
+                for sensor in sensor_values.keys():
+                    values = sensor_values[sensor]
+                    # Pad with NaN to make all arrays same length
+                    padded_values = values + [np.nan] * (max_len - len(values))
+                    corr_data[sensor] = padded_values
+
+                df_corr = pd.DataFrame(corr_data)
+                correlation_matrix = df_corr.corr()
+
+                fig2, ax2 = plt.subplots(figsize=(10, 8))
+                im = ax2.imshow(
+                    correlation_matrix, cmap="coolwarm", aspect="auto", vmin=-1, vmax=1
+                )
+                ax2.set_xticks(range(len(correlation_matrix.columns)))
+                ax2.set_yticks(range(len(correlation_matrix.columns)))
+                ax2.set_xticklabels(correlation_matrix.columns, rotation=45)
+                ax2.set_yticklabels(correlation_matrix.columns)
+                ax2.set_title("Sensor Correlation Matrix")
+
+                # Add correlation values to the plot
+                for i in range(len(correlation_matrix.columns)):
+                    for j in range(len(correlation_matrix.columns)):
+                        text = ax2.text(
+                            j,
+                            i,
+                            f"{correlation_matrix.iloc[i, j]:.2f}",
+                            ha="center",
+                            va="center",
+                            color="black",
+                            fontweight="bold",
+                        )
+
+                plt.colorbar(im, ax=ax2)
+                plt.tight_layout()
+
+                canvas2 = FigureCanvasTkAgg(fig2, corr_frame)
+                canvas2.draw()
+                canvas2.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+            # 3. Statistical Tests Tab
+            tests_frame = tb.Frame(notebook)
+            notebook.add(tests_frame, text="Statistical Tests")
+
+            # Perform statistical tests
+            tests_text = "📊 STATISTICAL TESTS RESULTS\n"
+            tests_text += "=" * 50 + "\n\n"
+
+            if all_values:
+                # Normality test
+                shapiro_stat, shapiro_p = stats.shapiro(
+                    all_values[:5000]
+                )  # Limit for performance
+                tests_text += f"🔍 NORMALITY TEST (Shapiro-Wilk)\n"
+                tests_text += f"{'─' * 30}\n"
+                tests_text += f"Statistic: {shapiro_stat:.6f}\n"
+                tests_text += f"P-value: {shapiro_p:.6f}\n"
+                tests_text += f"Result: {'Data appears normal' if shapiro_p > 0.05 else 'Data is not normal'}\n\n"
+
+                # Outlier detection using IQR
+                Q1 = np.percentile(all_values, 25)
+                Q3 = np.percentile(all_values, 75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                outliers = [x for x in all_values if x < lower_bound or x > upper_bound]
+
+                tests_text += f"🎯 OUTLIER DETECTION (IQR Method)\n"
+                tests_text += f"{'─' * 30}\n"
+                tests_text += f"Q1: {Q1:.4f}\n"
+                tests_text += f"Q3: {Q3:.4f}\n"
+                tests_text += f"IQR: {IQR:.4f}\n"
+                tests_text += f"Lower Bound: {lower_bound:.4f}\n"
+                tests_text += f"Upper Bound: {upper_bound:.4f}\n"
+                tests_text += f"Outliers Found: {len(outliers)}\n"
+                tests_text += f"Outlier Percentage: {(len(outliers) / len(all_values) * 100):.2f}%\n\n"
+
+                # Descriptive statistics
+                tests_text += f"📈 DESCRIPTIVE STATISTICS\n"
+                tests_text += f"{'─' * 30}\n"
+                tests_text += f"Skewness: {stats.skew(all_values):.4f}\n"
+                tests_text += f"Kurtosis: {stats.kurtosis(all_values):.4f}\n"
+                tests_text += f"Mean: {np.mean(all_values):.4f}\n"
+                tests_text += f"Median: {np.median(all_values):.4f}\n"
+                tests_text += (
+                    f"Mode: {stats.mode(all_values, keepdims=True)[0][0]:.4f}\n"
+                )
+                tests_text += f"Standard Error: {stats.sem(all_values):.4f}\n"
+
+            # Display tests results
+            tests_display = tk.Text(tests_frame, wrap=tk.WORD, font=("Consolas", 10))
+            tests_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            tests_display.insert(tk.END, tests_text)
+            tests_display.config(state=tk.DISABLED)
+
+        except Exception as e:
+            print(f"[ERROR] Advanced analysis failed: {e}")
+            self.show_notification(f"Advanced analysis failed: {e}", style="danger")
+
+    def export_filtered_csv(self):
+        """Export filtered data to CSV based on selected sensor."""
+        import csv
+        from tkinter import filedialog
+
+        selected_sensor = self.stats_sensor_var.get()
+
+        if not self.data_log:
+            self.show_notification("No data available for export.", style="warning")
+            return
+
+        # Filter data
+        if selected_sensor != "All Sensors":
+            filtered_data = [
+                entry for entry in self.data_log if entry["sensor"] == selected_sensor
+            ]
+        else:
+            filtered_data = self.data_log
+
+        if not filtered_data:
+            self.show_notification(
+                f"No data found for sensor: {selected_sensor}", style="warning"
+            )
+            return
+
+        # Ask user where to save
+        file = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            title=f"Export {selected_sensor} Data",
+        )
+        if not file:
+            return
+
+        # Export with enhanced format
+        with open(file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Enhanced header
+            writer.writerow(
+                [
+                    "Timestamp",
+                    "Sensor",
+                    "Value1",
+                    "Value2",
+                    "Value3",
+                    "Value4",
+                    "Value5",
+                    "Value6",
+                    "Value7",
+                    "Value8",
+                    "Value9",
+                    "Value10",
+                ]
+            )
+
+            for entry in filtered_data:
+                vals = list(entry["values"])[:10]
+                if len(vals) < 10:
+                    vals += [""] * (10 - len(vals))
+                writer.writerow([entry["timestamp"], entry["sensor"]] + vals)
+
+        self.show_notification(f"Filtered data exported to: {file}", style="success")
+
+    def toggle_recording(self):
+        """Toggle data recording on/off."""
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        """Start recording data to CSV file."""
+        from tkinter import filedialog
+        from datetime import datetime
+
+        # Generate default filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"sensor_data_{timestamp}.csv"
+
+        file = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            title="Save Recording As",
+            initialvalue=default_filename,
+        )
+        if file:
+            self.recording_path = file
+            self.is_recording = True
+
+            # Create the CSV file with headers
+            try:
+                import csv
+
+                with open(file, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            "Timestamp",
+                            "Sensor",
+                            "Value1",
+                            "Value2",
+                            "Value3",
+                            "Value4",
+                            "Value5",
+                            "Value6",
+                            "Value7",
+                            "Value8",
+                            "Value9",
+                            "Value10",
+                        ]
+                    )
+
+                # Update UI
+                self.record_button.config(
+                    text="⏹️ Stop Recording", bootstyle="warning-outline"
+                )
+                self.rec_status_lbl.config(
+                    text=f"🔴 Recording to: {file}", bootstyle="success"
+                )
+                logger.info(f"Started recording to: {file}")
+
+            except Exception as e:
+                messagebox.showerror(
+                    "Recording Error", f"Failed to start recording: {e}"
+                )
+                logger.error(f"Failed to start recording: {e}")
+
+    def stop_recording(self):
+        """Stop recording data."""
+        self.is_recording = False
+        self.record_button.config(text="🔴 Start Recording", bootstyle="danger-outline")
+        self.rec_status_lbl.config(text="⚪ Not Recording", bootstyle="secondary")
+        logger.info("Stopped recording")
+
+    def clear_data(self):
+        """Clear all data from the table and log."""
+        if messagebox.askyesno(
+            "Clear Data",
+            "Are you sure you want to clear all data? This action cannot be undone.",
+        ):
+            self.data_log.clear()
+            # Clear the table
+            for item in self.data_table.get_children():
+                self.data_table.delete(item)
+            # Update summary
+            self.data_summary.config(text="Data Points: 0")
+            logger.info("Data cleared by user")
+
+    def _update_stats_display(self, text):
+        """Update the statistics display text widget."""
+        self.stats_display.config(state="normal")
+        self.stats_display.delete(1.0, tk.END)
+        self.stats_display.insert(1.0, text)
+        self.stats_display.config(state="disabled")
+
     def show_tab(self, idx):
         for i, tab in enumerate(self.tabs):
             if i == idx:
@@ -1622,7 +3183,7 @@ class SeaLinkApp(tb.Window):
         for w in self.tab_dashboard.winfo_children():
             w.destroy()
         # Modern, welcoming header
-        header = tb.Frame(self.tab_dashboard)
+        header = tb.Frame(self.tab_dashboard, relief="ridge", borderwidth=1)
         header.pack(fill=X, pady=(20, 10))
         logo_img = Image.open("Sealielogo.png")
         logo_img = logo_img.resize((48, 48), Image.LANCZOS)
@@ -1631,7 +3192,9 @@ class SeaLinkApp(tb.Window):
         logo_label.image = logo_photo
         logo_label.pack(side=LEFT, padx=10)
         tb.Label(
-            header, text="Welcome to SeaLink Dashboard!", font=("Segoe UI", 22, "bold")
+            header,
+            text="Welcome to Sealie Sense Dashboard!",
+            font=("Segoe UI", 22, "bold"),
         ).pack(side=LEFT, padx=10)
         # Quick actions
         quick = tb.Frame(self.tab_dashboard)
@@ -1657,15 +3220,12 @@ class SeaLinkApp(tb.Window):
         # Modern meters/cards for each sensor (dashboard only)
         meters_frame = tb.Frame(self.tab_dashboard)
         meters_frame.pack(fill=X, pady=10)
-        # Show professional meters for DHT and IMU sensors
         for sensor in self.active_sensors:
             meter_card = tb.Frame(
                 meters_frame,
                 bootstyle="light",
-                borderwidth=1,
-                relief="solid",
-                padx=16,
-                pady=16,
+                borderwidth=2,
+                relief="raised",
             )
             meter_card.pack(side=LEFT, padx=24, pady=5, fill=Y)
             tb.Label(
@@ -1833,42 +3393,261 @@ class SeaLinkApp(tb.Window):
     def build_data_tab(self):
         for w in self.tab_data.winfo_children():
             w.destroy()
-        tb.Label(self.tab_data, text="Data", font=("Segoe UI", 18, "bold")).pack(
-            pady=20
+
+        # Main container with padding
+        main_container = tb.Frame(self.tab_data)
+        main_container.pack(fill=BOTH, expand=True, padx=15, pady=15)
+
+        # Header section with title and status
+        header_frame = tb.Frame(main_container)
+        header_frame.pack(fill=X, pady=(0, 15))
+
+        # Title and status in a clean layout
+        title_frame = tb.Frame(header_frame)
+        title_frame.pack(fill=X)
+
+        # Main title with icon
+        title_label = tb.Label(
+            title_frame,
+            text="📊 Data Management",
+            font=("Segoe UI", 18, "bold"),
+            bootstyle="primary",
         )
-        # Table of logged data
-        table_frame = tb.Frame(self.tab_data)
-        table_frame.pack(pady=10, fill=BOTH, expand=True)
-        columns = ("Timestamp", "Sensor", "Value1", "Value2", "Value3")
+        title_label.pack(side=LEFT)
+
+        # Status indicator with better styling
+        status_frame = tb.Frame(title_frame)
+        status_frame.pack(side=RIGHT)
+
+        rec_text = (
+            f"🔴 Recording to: {getattr(self, 'recording_path', '')}"
+            if self.is_recording
+            else "⚪ Not Recording"
+        )
+        self.rec_status_lbl = tb.Label(
+            status_frame,
+            text=rec_text,
+            font=("Segoe UI", 11),
+            bootstyle="success" if self.is_recording else "secondary",
+        )
+        self.rec_status_lbl.pack(side=RIGHT)
+
+        # Data controls section
+        controls_frame = tb.LabelFrame(
+            main_container, text="Data Controls", bootstyle="info"
+        )
+        controls_frame.pack(fill=X, pady=(0, 15))
+
+        # Control buttons in a clean row
+        control_buttons = tb.Frame(controls_frame)
+        control_buttons.pack(fill=X, padx=10, pady=10)
+
+        # Start/Stop recording button
+        self.record_button = tb.Button(
+            control_buttons,
+            text="🔴 Start Recording" if not self.is_recording else "⏹️ Stop Recording",
+            command=self.toggle_recording,
+            bootstyle="danger-outline" if not self.is_recording else "warning-outline",
+            width=15,
+        )
+        self.record_button.pack(side=LEFT, padx=(0, 10))
+
+        # Clear data button
+        tb.Button(
+            control_buttons,
+            text="🗑️ Clear Data",
+            command=self.clear_data,
+            bootstyle="warning-outline",
+            width=15,
+        ).pack(side=LEFT, padx=(0, 10))
+
+        # Export button
+        tb.Button(
+            control_buttons,
+            text="📤 Export All",
+            command=self.export_all_data,
+            bootstyle="success-outline",
+            width=15,
+        ).pack(side=LEFT, padx=(0, 10))
+
+        # Data summary
+        summary_frame = tb.Frame(control_buttons)
+        summary_frame.pack(side=RIGHT)
+
+        self.data_summary = tb.Label(
+            summary_frame,
+            text=f"Data Points: {len(self.data_log)}",
+            font=("Segoe UI", 10),
+            bootstyle="info",
+        )
+        self.data_summary.pack(side=RIGHT)
+
+        # Enhanced data table section
+        table_section = tb.LabelFrame(
+            main_container, text="Sensor Data", bootstyle="success"
+        )
+        table_section.pack(fill=BOTH, expand=True, pady=(0, 15))
+
+        # Table container with better styling
+        table_container = tb.Frame(table_section)
+        table_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        # Create enhanced Treeview
+        columns = (
+            "Timestamp",
+            "Sensor",
+            "Value1",
+            "Value2",
+            "Value3",
+            "Value4",
+            "Value5",
+            "Value6",
+            "Value7",
+            "Value8",
+            "Value9",
+            "Value10",
+        )
+
         self.data_table = tb.Treeview(
-            table_frame, columns=columns, show="headings", height=15
+            table_container, columns=columns, show="headings", height=12
         )
+
+        # Configure column headings with better widths
+        column_widths = {
+            "Timestamp": 150,
+            "Sensor": 120,
+            "Value1": 80,
+            "Value2": 80,
+            "Value3": 80,
+            "Value4": 80,
+            "Value5": 80,
+            "Value6": 80,
+            "Value7": 80,
+            "Value8": 80,
+            "Value9": 80,
+            "Value10": 80,
+        }
+
         for col in columns:
-            self.data_table.heading(col, text=col)
-            self.data_table.column(col, width=120)
-        self.data_table.pack(fill=BOTH, expand=True)
+            self.data_table.heading(col, text=col, anchor="center")
+            self.data_table.column(
+                col, width=column_widths[col], minwidth=60, anchor="center"
+            )
+
+        # Enhanced scrollbars
+        v_scrollbar = tb.Scrollbar(
+            table_container,
+            orient=VERTICAL,
+            command=self.data_table.yview,
+            bootstyle="primary",
+        )
+        h_scrollbar = tb.Scrollbar(
+            table_container,
+            orient=HORIZONTAL,
+            command=self.data_table.xview,
+            bootstyle="primary",
+        )
+        self.data_table.configure(
+            yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set
+        )
+
+        # Pack with better layout
+        self.data_table.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        table_container.grid_rowconfigure(0, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
+
+        # Populate table with existing data
         for entry in self.data_log:
-            vals = list(entry["values"]) + ["", ""]
+            vals = list(entry["values"])[:10]
+            if len(vals) < 10:
+                vals += [""] * (10 - len(vals))
             self.data_table.insert(
                 "",
                 "end",
-                values=(entry["timestamp"], entry["sensor"], vals[0], vals[1], vals[2]),
+                values=(entry["timestamp"], entry["sensor"], *vals),
             )
-        tb.Button(
-            self.tab_data,
-            text="Export All Data",
-            command=self.export_all_data,
-            bootstyle="info-outline",
-        ).pack(pady=10)
-        # Graph area (placeholder)
-        graph_frame = tb.Frame(self.tab_data)
-        graph_frame.pack(pady=10, fill=BOTH, expand=True)
+        # Statistical Analysis Tools
+        stats_frame = tb.Frame(self.tab_data)
+        stats_frame.pack(pady=10, fill=BOTH, expand=True)
+
+        # Statistics header
         tb.Label(
-            graph_frame,
-            text="Graph View (Coming Soon)",
-            font=("Segoe UI", 14, "italic"),
-            bootstyle="secondary",
-        ).pack(pady=20)
+            stats_frame,
+            text="Statistical Analysis Tools",
+            font=("Segoe UI", 14, "bold"),
+            bootstyle="info",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        # Statistics controls
+        stats_controls = tb.Frame(stats_frame)
+        stats_controls.pack(fill=X, padx=10, pady=5)
+
+        # Sensor selection for analysis
+        tb.Label(stats_controls, text="Analyze Sensor:", bootstyle="primary").pack(
+            side=LEFT, padx=(0, 10)
+        )
+        self.stats_sensor_var = tk.StringVar(value="All Sensors")
+        self.stats_sensor_combo = tb.Combobox(
+            stats_controls,
+            textvariable=self.stats_sensor_var,
+            values=[
+                "All Sensors",
+                "Temperature",
+                "Humidity",
+                "TDS",
+                "MPU6050",
+                "AS7341",
+                "DS18B20",
+            ],
+            state="readonly",
+            width=15,
+        )
+        self.stats_sensor_combo.pack(side=LEFT, padx=(0, 10))
+
+        # Analysis buttons
+        tb.Button(
+            stats_controls,
+            text="Calculate Statistics",
+            command=self.calculate_statistics,
+            bootstyle="success-outline",
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            stats_controls,
+            text="Generate Report",
+            command=self.generate_data_report,
+            bootstyle="info-outline",
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            stats_controls,
+            text="Plot Trends",
+            command=self.plot_data_trends,
+            bootstyle="warning-outline",
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            stats_controls,
+            text="Advanced Analysis",
+            command=self.advanced_data_analysis,
+            bootstyle="danger-outline",
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            stats_controls,
+            text="Export CSV",
+            command=self.export_filtered_csv,
+            bootstyle="secondary-outline",
+        ).pack(side=LEFT)
+
+        # Statistics display area
+        self.stats_display = tk.Text(
+            stats_frame, height=8, state="disabled", wrap="word", font=("Consolas", 9)
+        )
+        self.stats_display.pack(fill=BOTH, expand=True, padx=10, pady=5)
         # AI Data Assistant (offline)
         ai_frame = tb.Frame(self.tab_data)
         ai_frame.pack(pady=10, fill=BOTH, expand=True)
@@ -1897,8 +3676,13 @@ class SeaLinkApp(tb.Window):
             return
         self.ai_chat_entry.delete(0, tk.END)
         self.append_ai_chat(f"You: {user_msg}\n")
-        response = self.process_ai_query(user_msg)
-        self.append_ai_chat(f"AI: {response}\n")
+        # Route to selected AI provider (with fallback)
+        reply = ""
+        try:
+            reply = self.ai_func(user_msg)
+        except Exception as e:
+            reply = f"AI error: {e}"
+        self.append_ai_chat(f"AI ({self.ai_mode}): {reply}\n")
 
     def append_ai_chat(self, msg):
         self.ai_chat_log.config(state="normal")
@@ -2007,20 +3791,86 @@ class SeaLinkApp(tb.Window):
         label.image = photo
         label.pack()
 
-    def toggle_sidebar(self, event=None):
-        if self.sidebar_expanded:
-            self.sidebar_content.pack_forget()
-            self.sidebar.configure(width=self.sidebar_min_width)
-            self.sidebar_expanded = False
-            self.close_sidebar_btn.pack_forget()  # Hide close button
-        else:
+    def _ensure_sidebar_content(self):
+        """Rebuild the sidebar content if missing (after collapses or rebuilds)."""
+        # Create container if missing
+        if not hasattr(self, "sidebar_content") or self.sidebar_content is None:
+            self.sidebar_content = tb.Frame(self.sidebar, bootstyle="dark")
             self.sidebar_content.pack(pady=(10, 0), fill=Y, expand=True)
-            self.sidebar.configure(width=self.sidebar_max_width)
-            self.sidebar.lift()
+        # If already has children, keep as is
+        if self.sidebar_content.winfo_children():
+            return
+        # Logo and app name
+        logo_frame = tb.Frame(self.sidebar_content, bootstyle="dark")
+        logo_frame.pack(pady=(10, 10))
+        try:
+            logo_img = Image.open("Sealielogo.png").resize((48, 48), Image.LANCZOS)
+            _photo = ImageTk.PhotoImage(logo_img)
+            lbl = tk.Label(logo_frame, image=_photo)
+            lbl.image = _photo
+            lbl.pack()
+        except Exception:
+            tb.Label(logo_frame, text="SeaLink", font=("Segoe UI", 18, "bold")).pack()
+
+        # Nav buttons
+        def _btn(parent, text, cmd, tip):
+            b = tb.Button(parent, text=text, command=cmd, bootstyle="dark")
+            b.pack(fill=X, pady=8, padx=20)
+            try:
+                self.add_hover(b)
+                self.create_tooltip(b, tip)
+            except Exception:
+                pass
+            return b
+
+        _btn(
+            self.sidebar_content,
+            "Dashboard",
+            lambda: self.show_tab(0),
+            "Show dashboard overview",
+        )
+        _btn(
+            self.sidebar_content,
+            "Sensors",
+            lambda: self.show_tab(1),
+            "View and manage sensors",
+        )
+        _btn(
+            self.sidebar_content,
+            "Data",
+            lambda: self.show_tab(2),
+            "View and export sensor data",
+        )
+        _btn(
+            self.sidebar_content, "Settings", self.show_settings, "Open settings dialog"
+        )
+        _btn(self.sidebar_content, "About", lambda: self.show_tab(4), "About SeaLink")
+
+    def toggle_sidebar(self, event=None):
+        # Guard: sidebar may not be built yet
+        if not hasattr(self, "sidebar") or self.sidebar is None:
+            return
+        if self.sidebar_expanded:
+            # collapse: keep frame, shrink width and hide inner content
+            try:
+                if hasattr(self, "sidebar_content") and self.sidebar_content:
+                    self.sidebar_content.pack_forget()
+                self.sidebar.configure(width=self.sidebar_min_width)
+                self.sidebar.pack_propagate(False)
+            except Exception:
+                pass
+            self.sidebar_expanded = False
+        else:
+            # expand: restore width and (re)build content if needed
+            try:
+                self.sidebar.configure(width=180)
+                self._ensure_sidebar_content()
+                self.sidebar_content.pack(pady=(10, 0), fill=Y, expand=True)
+                self.sidebar.pack(side=LEFT, fill=Y)
+                self.sidebar.pack_propagate(False)
+            except Exception:
+                pass
             self.sidebar_expanded = True
-            self.close_sidebar_btn.pack(
-                anchor="ne", padx=10, pady=5
-            )  # Show close button
 
     def drag_sidebar(self, event):
         # Allow user to drag to resize sidebar
@@ -2144,6 +3994,536 @@ class SeaLinkApp(tb.Window):
             popup.destroy()
 
         tb.Button(popup, text="Save", command=save, bootstyle="success").pack(pady=10)
+
+    def init_ai(self):
+        """Initialize AI provider: OpenAI online or GPT4All offline, with graceful fallback."""
+        self.ai_mode = "Disabled"
+        self.ai_func = lambda q: "AI is disabled. Configure in Settings."
+        provider = self.settings.get("ai_provider", "simple").lower()
+        key = self.settings.get("openai_api_key", "").strip()
+        # Try OpenAI if allowed
+        tried_openai = False
+        if provider in ("auto", "openai") and key:
+            try:
+                import openai  # type: ignore
+
+                openai.api_key = key
+
+                def _ask_openai(prompt: str) -> str:
+                    try:
+                        resp = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.2,
+                            max_tokens=400,
+                        )
+                        return resp.choices[0].message["content"].strip()
+                    except Exception as e:
+                        return f"OpenAI error: {e}"
+
+                self.ai_func = _ask_openai
+                self.ai_mode = "Online (OpenAI)"
+                tried_openai = True
+                if hasattr(self, "ai_status_lbl"):
+                    self.ai_status_lbl.config(text="AI: Online", bootstyle="success")
+            except Exception:
+                tried_openai = True
+        # Try GPT4All if allowed or OpenAI failed
+        if (
+            self.ai_mode == "Disabled"
+            and provider in ("auto", "gpt4all")
+            and GPT4ALL_AVAILABLE
+        ):
+            try:
+                from gpt4all import GPT4All  # type: ignore
+                import time
+                import os
+
+                # Try to initialize GPT4All with better error handling
+                # Use a more reliable model that's known to work
+                model_name = "orca-mini-3b-gguf2-q4_0.gguf"
+
+                # Check if model file exists and is not locked
+                model_path = os.path.expanduser("~/.cache/gpt4all")
+                model_file = os.path.join(model_path, model_name)
+
+                if os.path.exists(model_file + ".part"):
+                    # Model is still downloading, wait a bit
+                    print("[AI] Model still downloading, waiting...")
+                    time.sleep(2)
+
+                print(f"[AI] Attempting to load GPT4All model: {model_name}")
+                self.llm = GPT4All(model_name, allow_download=True, verbose=True)
+
+                def _ask_gpt4all(prompt: str) -> str:
+                    try:
+                        if self.llm is None:
+                            return "GPT4All model not loaded. Please restart the application."
+
+                        # Simplified GPT4All generation for faster responses
+                        try:
+                            print(f"[AI] Generating response for: '{prompt[:50]}...'")
+                            # Use simpler parameters for faster generation
+                            response = self.llm.generate(
+                                prompt, max_tokens=50, temp=0.1
+                            ).strip()
+
+                            print(f"[AI] GPT4All response: '{response[:100]}...'")
+
+                            # Clean up the response
+                            if response.startswith("User question:"):
+                                response = response.split("User question:")[-1].strip()
+
+                            # Return the response if we got one
+                            if response and len(response) > 5:
+                                print("[AI] Using GPT4All response")
+                                return response
+                            else:
+                                # Fallback to simple AI if response is too short
+                                print("[AI] GPT4All response too short, using fallback")
+                                return self._simple_ai_fallback(prompt)
+
+                        except Exception as e:
+                            print(f"[AI] GPT4All generation error: {e}")
+                            return self._simple_ai_fallback(prompt)
+                    except Exception as e:
+                        return f"GPT4All error: {e}"
+
+                self.ai_func = _ask_gpt4all
+                self.ai_mode = "Ready (GPT4All)"
+                if hasattr(self, "ai_status_lbl"):
+                    self.ai_status_lbl.config(text="AI: Ready", bootstyle="success")
+                print(
+                    "[AI] GPT4All initialized successfully (CPU mode - CUDA warnings are normal)"
+                )
+            except Exception as e:
+                print(f"[AI] GPT4All initialization failed: {e}")
+                # Try a different model as fallback
+                try:
+                    print("[AI] Trying fallback model: gpt4all-falcon-q4_0.gguf")
+                    self.llm = GPT4All(
+                        "gpt4all-falcon-q4_0.gguf", allow_download=True, verbose=True
+                    )
+
+                    def _ask_gpt4all_fallback(prompt: str) -> str:
+                        try:
+                            if self.llm is None:
+                                return "GPT4All model not loaded. Please restart the application."
+                            response = self.llm.generate(
+                                prompt, max_tokens=200, temp=0.7
+                            ).strip()
+                            if response.startswith("User question:"):
+                                response = response.split("User question:")[-1].strip()
+                            return (
+                                response
+                                if response
+                                else "I'm having trouble processing that request. Please try rephrasing your question."
+                            )
+                        except Exception as e:
+                            return f"GPT4All error: {e}"
+
+                    self.ai_func = _ask_gpt4all_fallback
+                    self.ai_mode = "Ready (GPT4All-Falcon)"
+                    if hasattr(self, "ai_status_lbl"):
+                        self.ai_status_lbl.config(text="AI: Ready", bootstyle="success")
+                    print("[AI] GPT4All Falcon model initialized successfully")
+                except Exception as e2:
+                    print(f"[AI] Fallback model also failed: {e2}")
+                    # Set up a delayed retry
+                    self.after(5000, self._retry_gpt4all_init)
+                    pass
+        # Use simple AI as default for fast responses
+        if self.ai_mode == "Disabled" and provider in ("simple", "auto", "gpt4all"):
+            if not tried_openai and not GPT4ALL_AVAILABLE:
+                self.ai_func = (
+                    lambda q: "No AI providers available. Install openai/gpt4all or set AI to None."
+                )
+            else:
+                # Enhanced conversational AI for fast, natural responses
+                def _simple_ai(prompt: str) -> str:
+                    prompt_lower = prompt.lower()
+
+                    # Greeting responses
+                    if any(
+                        word in prompt_lower
+                        for word in ["hello", "hi", "hey", "greetings"]
+                    ):
+                        return "Hello! I'm your IoT assistant. I can help you with sensor data analysis, Arduino projects, and technical questions. What would you like to know?"
+
+                    # General conversation
+                    elif any(
+                        word in prompt_lower
+                        for word in ["how are you", "how's it going", "what's up"]
+                    ):
+                        return "I'm doing great! I'm here to help you with your IoT project. I can see you have sensors connected and data flowing in. What would you like to explore?"
+
+                    # Weather/General questions
+                    elif any(
+                        word in prompt_lower
+                        for word in ["weather", "temperature outside", "hot", "cold"]
+                    ):
+                        return "I can see your sensor data, but I don't have access to external weather data. However, I can help you interpret your temperature sensor readings! Your sensors show real-time environmental data."
+
+                    # Chemical/Educational questions
+                    elif "chemical formula" in prompt_lower and "water" in prompt_lower:
+                        return "The chemical formula for water is H₂O - two hydrogen atoms and one oxygen atom. This is a fundamental compound in chemistry and essential for life!"
+
+                    # Technology questions
+                    elif any(
+                        word in prompt_lower
+                        for word in ["computer", "laptop", "technology", "programming"]
+                    ):
+                        return "I can help with programming and technology questions! For your IoT project, I can assist with Arduino code, sensor integration, and data analysis. What specific tech topic interests you?"
+
+                    # Temperature questions
+                    elif "temperature" in prompt_lower or "temp" in prompt_lower:
+                        return "Temperature sensors like DHT11/DHT22 measure ambient temperature. Normal range is 0-50°C for most applications. Your current readings show real-time temperature data from your connected sensors."
+
+                    # Humidity questions
+                    elif "humidity" in prompt_lower or "hum" in prompt_lower:
+                        return "Humidity sensors measure water vapor in air. Normal indoor range is 30-70% RH. Your sensor data shows current humidity levels that you can monitor in real-time."
+
+                    # IMU/Motion questions
+                    elif any(
+                        word in prompt_lower
+                        for word in [
+                            "imu",
+                            "gyro",
+                            "accelerometer",
+                            "motion",
+                            "orientation",
+                            "mpu6050",
+                        ]
+                    ):
+                        return "IMU sensors (MPU6050) measure orientation and motion. Values are in degrees for pitch/roll/yaw. You can see the 3D orientation visualization in the Sensors tab when your MPU6050 is connected."
+
+                    # Water quality questions
+                    elif any(
+                        word in prompt_lower
+                        for word in ["tds", "water", "quality", "ppm"]
+                    ):
+                        return "TDS sensors measure water quality in parts per million (ppm). Lower values indicate purer water. Your TDS readings are displayed in real-time on the dashboard."
+
+                    # Light/Color questions
+                    elif any(
+                        word in prompt_lower
+                        for word in [
+                            "spectrometer",
+                            "as7341",
+                            "light",
+                            "color",
+                            "spectrum",
+                        ]
+                    ):
+                        return "AS7341 spectrometer measures light across different wavelengths. It's useful for color analysis and light sensing. The bar chart in the Sensors tab shows the spectral data from your AS7341 sensor."
+
+                    # Help questions
+                    elif any(
+                        word in prompt_lower
+                        for word in ["help", "what", "how", "explain"]
+                    ):
+                        return "I can help you with:\n• Sensor data interpretation\n• Arduino project guidance\n• IoT system troubleshooting\n• Data analysis and insights\n• General technical questions\n\nWhat specific question do you have?"
+
+                    # Default response - more conversational and helpful
+                    else:
+                        return f"I understand you're asking about: '{prompt}'. I can help with sensor data analysis, Arduino projects, IoT systems, and general technical questions. Could you be more specific about what you'd like to know? For example, you could ask about your temperature readings, IMU orientation data, water quality measurements, or any other technical topic!"
+
+                self.ai_func = _simple_ai
+                self.ai_mode = "Simple Rules"
+                if hasattr(self, "ai_status_lbl"):
+                    self.ai_status_lbl.config(text="AI: Simple", bootstyle="warning")
+        # Update AI status label
+        if hasattr(self, "ai_status_lbl"):
+            if self.ai_mode == "Disabled":
+                self.ai_status_lbl.config(text="AI: Disabled", bootstyle="secondary")
+            elif "GPT4All" in self.ai_mode:
+                self.ai_status_lbl.config(text="AI: Ready", bootstyle="success")
+            elif "OpenAI" in self.ai_mode:
+                self.ai_status_lbl.config(text="AI: Online", bootstyle="success")
+            elif "Simple" in self.ai_mode:
+                self.ai_status_lbl.config(text="AI: Simple", bootstyle="warning")
+
+    def _simple_ai_fallback(self, prompt: str) -> str:
+        """Simple AI fallback for when GPT4All times out."""
+        prompt_lower = prompt.lower()
+
+        if any(word in prompt_lower for word in ["hello", "hi", "hey", "greetings"]):
+            return "Hello! I'm your IoT assistant. I can help you with sensor data analysis, Arduino projects, and technical questions. What would you like to know?"
+        elif "temperature" in prompt_lower or "temp" in prompt_lower:
+            return "Temperature sensors like DHT11/DHT22 measure ambient temperature. Normal range is 0-50°C for most applications. Your current readings show real-time temperature data from your connected sensors."
+        elif "humidity" in prompt_lower or "hum" in prompt_lower:
+            return "Humidity sensors measure water vapor in air. Normal indoor range is 30-70% RH. Your sensor data shows current humidity levels that you can monitor in real-time."
+        elif any(
+            word in prompt_lower
+            for word in [
+                "imu",
+                "gyro",
+                "accelerometer",
+                "motion",
+                "orientation",
+                "mpu6050",
+            ]
+        ):
+            return "IMU sensors (MPU6050) measure orientation and motion. Values are in degrees for pitch/roll/yaw. You can see the 3D orientation visualization in the Sensors tab when your MPU6050 is connected."
+        elif any(word in prompt_lower for word in ["tds", "water", "quality", "ppm"]):
+            return "TDS sensors measure water quality in parts per million (ppm). Lower values indicate purer water. Your TDS readings are displayed in real-time on the dashboard."
+        elif any(
+            word in prompt_lower
+            for word in ["spectrometer", "as7341", "light", "color", "spectrum"]
+        ):
+            return "AS7341 spectrometer measures light across different wavelengths. It's useful for color analysis and light sensing. The bar chart in the Sensors tab shows the spectral data from your AS7341 sensor."
+        else:
+            return f"I understand you're asking about: '{prompt}'. I can help with sensor data analysis, Arduino projects, and IoT systems. Could you be more specific about what you'd like to know?"
+
+    def _retry_gpt4all_init(self):
+        """Retry GPT4All initialization after a delay."""
+        if self.ai_mode == "Disabled" and GPT4ALL_AVAILABLE:
+            print("[AI] Retrying GPT4All initialization...")
+            self.init_ai()
+
+    def _ingest_template_sensor(self, sensor, data):
+        s_type = sensor.get("type", "").upper()
+        s_name = sensor.get("name", s_type)
+        now = time.time() - self.start_time
+        # Normalize floats
+        for k, v in list(data.items()):
+            try:
+                data[k] = float(v)
+            except Exception:
+                pass
+        if s_type in ("DHT11", "DHT22"):
+            temp = float(data.get("TEMP", 0.0))
+            hum = float(data.get("HUM", 0.0))
+            self.append_dht_data(temp, hum)
+            self.log_data("DHT", (temp, hum))
+        elif s_type in ("MPU6050", "ITG/MPU6050"):
+            self.yaw = float(data.get("YAW", 0.0))
+            self.pitch = float(data.get("PITCH", 0.0))
+            self.roll = float(data.get("ROLL", 0.0))
+            self.log_data("3D Orientation", (self.yaw, self.pitch, self.roll))
+            # Update meters if present
+            w = self.imu_widgets.get(s_name)
+            if w:
+                try:
+                    w.get("yaw").configure(amountused=self.yaw)
+                    w.get("pitch").configure(amountused=self.pitch)
+                    w.get("roll").configure(amountused=self.roll)
+                except Exception:
+                    pass
+            self.update_3d_orientation()
+            self.update_all_meters()
+        elif s_type == "AS7341":
+            # Spectrometer: baseline subtraction, normalize, smooth, update bars
+            keys = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "CLEAR", "NIR"]
+            state = self.as7341_state.setdefault(
+                s_name, {"baseline": {}, "smoothed": [0.0] * 10}
+            )
+            baseline = state.get("baseline", {})
+            vals = [
+                max((data.get(k, 0.0) - baseline.get(k, 0.0)), 0.0) for k in keys[:8]
+            ]
+            max_val = max(vals) if max(vals) > 0 else 1.0
+            normalized = [v / max_val for v in vals]
+            alpha = 0.2
+            smoothed = [
+                alpha * n + (1 - alpha) * s
+                for n, s in zip(normalized, state.get("smoothed", [0.0] * 8))
+            ]
+            state["smoothed"] = smoothed
+            # If bars exist, update in-place
+            bars = state.get("bars", [])
+            if bars:
+                try:
+                    import matplotlib
+                    from matplotlib.colors import LinearSegmentedColormap
+
+                    bar_colors = [
+                        [(148 / 255, 0, 211 / 255), (75 / 255, 0, 130 / 255)],
+                        [(75 / 255, 0, 130 / 255), (0, 0, 1)],
+                        [(0, 0, 1), (0, 1, 1)],
+                        [(0, 1, 1), (0, 1, 0)],
+                        [(0, 1, 0), (1, 1, 0)],
+                        [(1, 1, 0), (1, 127 / 255, 0)],
+                        [(1, 127 / 255, 0), (1, 0, 0)],
+                        [(1, 0, 0), (148 / 255, 0, 211 / 255)],
+                    ]
+                    for i, bar in enumerate(bars):
+                        cmap = LinearSegmentedColormap.from_list(
+                            f"bar{i}", bar_colors[i]
+                        )
+                        bar.set_height(smoothed[i])
+                        bar.set_color(cmap(smoothed[i]))
+                    canvas = state.get("canvas")
+                    if canvas:
+                        canvas.draw()
+                except Exception:
+                    pass
+            else:
+                # No bars yet; request UI to build the card (debounced)
+                self.request_sensors_refresh()
+            self.log_data("AS7341", tuple(vals))
+        else:
+            # Generic multi-field ingest into generic_streams
+            stream = self.generic_streams.setdefault(s_name, {"time": []})
+            stream["time"].append(now)
+            for f in sensor.get("fields", []):
+                stream.setdefault(f, []).append(float(data.get(f, 0.0)))
+                # limit
+                stream[f] = stream[f][-200:]
+            stream["time"] = stream["time"][-200:]
+            self.log_data(
+                s_type, tuple(data.get(f, None) for f in sensor.get("fields", []))
+            )
+            self.request_sensors_refresh()
+
+    def _parse_csv_sensor_line(self, line: str) -> bool:
+        # Handle lines like: SENSOR,VAL[,VAL2,VAL3]
+        try:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                return False
+            sensor_type = parts[0].upper()
+            # Find matching active sensor by type or alias
+            match_sensor = None
+            for s in self.active_sensors:
+                t = s.get("type", "").upper()
+                if t == sensor_type:
+                    match_sensor = s
+                    break
+                if sensor_type == "MPU6050" and t in ("MPU6050", "ITG/MPU6050"):
+                    match_sensor = s
+                    break
+            # If not found, auto-attach a sensor from templates
+            if match_sensor is None:
+                tpl = self._get_template_by_type(sensor_type)
+                if tpl is None:
+                    fields = [f"F{i + 1}" for i in range(len(parts) - 1)]
+                    match_sensor = {
+                        "type": sensor_type,
+                        "name": sensor_type,
+                        "port": "",
+                        "icon": "🧩",
+                        "fields": fields,
+                        "graph": "single-line" if len(fields) == 1 else "dual-line",
+                        "_compiled": None,
+                        "_labels": {f: f for f in fields},
+                        "_ranges": {},
+                    }
+                else:
+                    match_sensor = {
+                        "type": sensor_type,
+                        "name": sensor_type,
+                        "port": "",
+                        "icon": tpl.get("icon", "🧩"),
+                        "fields": tpl.get("fields", []),
+                        "graph": tpl.get("graph_type", "single-line"),
+                        "_compiled": tpl.get("_compiled"),
+                        "_labels": tpl.get("labels", {}),
+                        "_ranges": tpl.get("ranges", {}),
+                    }
+                self.active_sensors.append(match_sensor)
+                if match_sensor["name"] not in self.generic_streams:
+                    self.generic_streams[match_sensor["name"]] = {"time": []}
+                    for f in match_sensor.get("fields", []):
+                        self.generic_streams[match_sensor["name"]][f] = []
+                try:
+                    self.build_sensors_tab()
+                except Exception:
+                    pass
+            # Map values to fields in order
+            values = []
+            for v in parts[1:]:
+                try:
+                    values.append(float(v))
+                except Exception:
+                    values.append(0.0)
+            fields = match_sensor.get("fields", [])
+            # Special case: DS18B20 sometimes outputs -127 as error; ignore
+            if sensor_type == "DS18B20" and len(values) >= 1 and values[0] <= -120:
+                return True
+            # Special case: MPU6050 CSV with only 2 values -> assume Pitch, Roll
+            if (
+                sensor_type in ("MPU6050", "ITG/MPU6050")
+                and len(fields) == 3
+                and len(values) == 2
+            ):
+                values = [0.0] + values
+            # Pad or trim to fields length
+            if len(values) < len(fields):
+                values += [0.0] * (len(fields) - len(values))
+            if len(values) > len(fields):
+                values = values[: len(fields)]
+            data = {f: values[i] for i, f in enumerate(fields)}
+            try:
+                self.after(
+                    0, lambda s=match_sensor, d=data: self._ingest_template_sensor(s, d)
+                )
+            except Exception as e:
+                print(f"[CSV PARSE WARN] {e}")
+            return True
+        except Exception:
+            return False
+
+    def _try_parse_as7341(self, line: str) -> bool:
+        # Supports lines like:
+        #  "AS7341, F1:123, F2:456, ..., CLEAR:789, NIR:101"
+        #  or per-line prints like "F1 415nm: 123"
+        keys = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "CLEAR", "NIR"]
+        rx = re.compile(
+            r"\b(F[1-8]|CLEAR|NIR)\b(?:\s*\d*nm)?\s*:\s*(-?\d+(?:\.\d+)?)",
+            re.IGNORECASE,
+        )
+        matches = rx.findall(line)
+        if not matches and not line.upper().startswith("AS7341"):
+            return False
+        # If it is an AS7341 line with CSV of only numbers, let CSV parser handle it
+        if line.upper().startswith("AS7341,") and ":" not in line:
+            return False
+        now = time.time()
+        # Reset buffer if stale
+        if now - self._as7341_buf.get("t", 0) > 1.5:
+            self._as7341_buf = {"data": {}, "t": now}
+        self._as7341_buf["t"] = now
+        # Accumulate any key:value pairs in the line
+        for k, v in matches:
+            try:
+                self._as7341_buf["data"][k.upper()] = float(v)
+            except Exception:
+                pass
+        # If we have all keys, ingest
+        if all(k in self._as7341_buf["data"] for k in keys):
+            data = {k: self._as7341_buf["data"][k] for k in keys}
+            # Find or add sensor
+            sensor = None
+            for s in self.active_sensors:
+                if s.get("type", "").upper() == "AS7341":
+                    sensor = s
+                    break
+            if sensor is None:
+                tpl = self._get_template_by_type("AS7341") or {}
+                sensor = {
+                    "type": "AS7341",
+                    "name": "AS7341",
+                    "port": "",
+                    "icon": tpl.get("icon", "🌈"),
+                    "fields": tpl.get("fields", keys),
+                    "graph": tpl.get("graph_type", "multi-line"),
+                    "_compiled": tpl.get("_compiled"),
+                    "_labels": tpl.get("labels", {k: k for k in keys}),
+                    "_ranges": tpl.get("ranges", {}),
+                }
+                self.active_sensors.append(sensor)
+                if sensor["name"] not in self.generic_streams:
+                    self.generic_streams[sensor["name"]] = {"time": []}
+                    for f in sensor.get("fields", []):
+                        self.generic_streams[sensor["name"]][f] = []
+                self.request_sensors_refresh()
+            # Ingest through the same path as generic sensors
+            self._ingest_template_sensor(sensor, data)
+            # Reset buffer for next frame
+            self._as7341_buf = {"data": {}, "t": now}
+            return True
+        return bool(matches)
 
 
 if __name__ == "__main__":
