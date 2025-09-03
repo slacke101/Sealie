@@ -1,14 +1,14 @@
-# SeaLink Dashboard
+# Sealie Sense
 
-**Author:** Rafael Castro  
+**Author:** Rafael A Castro  
 **Started:** ~March 27, 2025  
-**Last Updated:** June 27, 2025
+**Last Updated:** September 3rd, 2025
 
 ---
 
 ## Overview
 
-SeaLink Dashboard is a modern, professional Python desktop application for real-time sensor data visualization, device management, and serial communication. Built with Tkinter and ttkbootstrap, it provides a beautiful, responsive UI for monitoring Arduino and other microcontroller sensor data, with advanced features for data logging, export, and analysis.
+Sealie Sense is a modern, professional Python desktop application for real-time sensor data visualization, device management, and serial communication. Built with Tkinter and ttkbootstrap, it provides a beautiful, responsive UI for monitoring Arduino and other microcontroller sensor data, with advanced features for data logging, export, and analysis.
 
 ---
 
@@ -109,9 +109,9 @@ pip install ttkbootstrap pillow pyserial matplotlib numpy pandas
 
 ## Credits
 
-- Developed by **Rafael Castro**
+- Developed by **Rafael A Castro**
 - Started: March 22, 2025
-- Last updated: June 27, 2025
+- Last updated: September 3rd, 2025
 - Special thanks to the open-source Python and Arduino communities
 
 ---
