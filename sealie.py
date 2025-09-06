@@ -35,11 +35,11 @@ except ImportError:
     GPT4ALL_AVAILABLE = False
 
 # Application metadata
-APP_NAME = "Sealie Sense Studio"
+APP_NAME = "Sealie Sense"
 APP_VERSION = "1.0.0"
 APP_DESCRIPTION = "Professional IoT Sensor Data Visualization & Analysis Platform"
 APP_AUTHOR = "Castron Technologies"
-APP_WEBSITE = "https://castron.org"
+APP_WEBSITE = "https://castron.tech"
 APP_COPYRIGHT = "© 2024 Castron Technologies. All rights reserved."
 
 # Configure logging
@@ -1858,6 +1858,58 @@ AI Assistant:
                         [x[i], x[j]], [y[i], y[j]], [z[i], z[j]], color="blue"
                     )
 
+    def _create_3d_orientation_for_data_tab(self, parent):
+        """Create 3D orientation plot specifically for the data management tab"""
+        try:
+            # Create figure for data tab
+            fig3d = Figure(figsize=(6, 4), dpi=100)
+            self.ax3d_data = fig3d.add_subplot(111, projection="3d")
+            self.ax3d_data.set_xlim([-1, 1])
+            self.ax3d_data.set_ylim([-1, 1])
+            self.ax3d_data.set_zlim([-1, 1])
+            self.ax3d_data.set_title("3D Orientation - Live MPU Data")
+
+            # Initialize cube data for data tab
+            self.cube_data_data_tab = self.make_cube()
+            self.plot_cube_data_tab(*self.cube_data_data_tab)
+
+            # Create canvas for data tab
+            self.canvas3d_data = FigureCanvasTkAgg(fig3d, master=parent)
+            self.canvas3d_data.draw()
+            self.canvas3d_data.get_tk_widget().pack(fill=BOTH, expand=True)
+
+        except Exception as e:
+            print(f"[ERROR] Failed to create 3D orientation for data tab: {e}")
+
+    def plot_cube_data_tab(self, x, y, z):
+        """Plot cube specifically for data tab 3D orientation"""
+        try:
+            self.ax3d_data.cla()
+            self.ax3d_data.set_xlim([-1, 1])
+            self.ax3d_data.set_ylim([-1, 1])
+            self.ax3d_data.set_zlim([-1, 1])
+            self.ax3d_data.set_title("3D Orientation - Live MPU Data")
+            self.ax3d_data.scatter(x, y, z, color="skyblue", s=50)
+
+            # Draw cube edges
+            for i in range(8):
+                for j in range(i + 1, 8):
+                    if (
+                        np.linalg.norm(
+                            np.array([x[i], y[i], z[i]]) - np.array([x[j], y[j], z[j]])
+                        )
+                        == 1.0
+                    ):
+                        self.ax3d_data.plot(
+                            [x[i], x[j]],
+                            [y[i], y[j]],
+                            [z[i], z[j]],
+                            color="blue",
+                            linewidth=2,
+                        )
+        except Exception as e:
+            print(f"[ERROR] Failed to plot cube in data tab: {e}")
+
     def update_3d_orientation(self):
         """
         Update the 3D orientation plot based on the latest sensor data.
@@ -1885,6 +1937,16 @@ AI Assistant:
             self.plot_cube(rotated[0], rotated[1], rotated[2])
             if hasattr(self, "canvas3d"):
                 self.canvas3d.draw()
+
+            # Also update data tab 3D orientation if it exists
+            if hasattr(self, "cube_data_data_tab") and hasattr(self, "ax3d_data"):
+                rotated_data_tab = Rz @ Ry @ Rx @ self.cube_data_data_tab
+                self.plot_cube_data_tab(
+                    rotated_data_tab[0], rotated_data_tab[1], rotated_data_tab[2]
+                )
+                if hasattr(self, "canvas3d_data"):
+                    self.canvas3d_data.draw()
+
         except Exception as e:
             print(f"[ERROR] 3D orientation update failed: {e}")
 
@@ -3353,20 +3415,109 @@ Application Status:
             stats_frame, text=self.get_quick_stats(), font=("Segoe UI", 12)
         )
         self.quick_stats.pack()
-        # Recent activity/log (placeholder)
-        log_frame = tb.Frame(self.tab_dashboard)
-        log_frame.pack(fill=BOTH, expand=True, pady=10)
-        tb.Label(
-            log_frame,
-            text="Recent Activity",
-            font=("Segoe UI", 12, "italic"),
-            bootstyle="secondary",
-        ).pack(anchor="w", padx=10)
-        log_text = tk.Text(log_frame, height=6, state="normal")
-        for line in getattr(self, "_serial_debug_log", [])[-10:]:
-            log_text.insert(tk.END, line + "\n")
-        log_text.config(state="disabled")
-        log_text.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        # Live Sensor Meters - REPLACED Recent Activity
+        meters_section = tb.LabelFrame(
+            self.tab_dashboard, text="📊 Live Sensor Readings", bootstyle="info"
+        )
+        meters_section.pack(fill=BOTH, expand=True, pady=10)
+
+        # Create meters container
+        meters_container = tb.Frame(meters_section)
+        meters_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        # Temperature meter
+        if hasattr(self, "temp_data") and self.temp_data:
+            temp_frame = tb.Frame(meters_container)
+            temp_frame.pack(fill=X, pady=5)
+            self._draw_enhanced_meter(
+                temp_frame,
+                "🌡️ Temperature",
+                self.temp_data[-1] if self.temp_data else 0,
+                -10,
+                60,
+                "#ff6b6b",
+            )
+
+        # Humidity meter
+        if hasattr(self, "hum_data") and self.hum_data:
+            hum_frame = tb.Frame(meters_container)
+            hum_frame.pack(fill=X, pady=5)
+            self._draw_enhanced_meter(
+                hum_frame,
+                "💧 Humidity",
+                self.hum_data[-1] if self.hum_data else 0,
+                0,
+                100,
+                "#4ecdc4",
+            )
+
+        # TDS meter
+        if hasattr(self, "tds_data") and self.tds_data:
+            tds_frame = tb.Frame(meters_container)
+            tds_frame.pack(fill=X, pady=5)
+            self._draw_enhanced_meter(
+                tds_frame,
+                "💧 Water Quality (TDS)",
+                self.tds_data[-1] if self.tds_data else 0,
+                0,
+                1500,
+                "#45b7d1",
+            )
+
+        # IMU orientation meters
+        if hasattr(self, "yaw") and (
+            self.yaw != 0 or self.pitch != 0 or self.roll != 0
+        ):
+            imu_frame = tb.Frame(meters_container)
+            imu_frame.pack(fill=X, pady=5)
+
+            # Yaw meter
+            yaw_subframe = tb.Frame(imu_frame)
+            yaw_subframe.pack(fill=X, pady=2)
+            self._draw_enhanced_meter(
+                yaw_subframe, "🧭 Yaw", self.yaw, -180, 180, "#96ceb4"
+            )
+
+            # Pitch meter
+            pitch_subframe = tb.Frame(imu_frame)
+            pitch_subframe.pack(fill=X, pady=2)
+            self._draw_enhanced_meter(
+                pitch_subframe, "📐 Pitch", self.pitch, -90, 90, "#feca57"
+            )
+
+            # Roll meter
+            roll_subframe = tb.Frame(imu_frame)
+            roll_subframe.pack(fill=X, pady=2)
+            self._draw_enhanced_meter(
+                roll_subframe, "🔄 Roll", self.roll, -180, 180, "#ff9ff3"
+            )
+
+        # No data message
+        if not any(
+            [
+                hasattr(self, "temp_data") and self.temp_data,
+                hasattr(self, "hum_data") and self.hum_data,
+                hasattr(self, "tds_data") and self.tds_data,
+                hasattr(self, "yaw")
+                and (self.yaw != 0 or self.pitch != 0 or self.roll != 0),
+            ]
+        ):
+            no_data_frame = tb.Frame(meters_container)
+            no_data_frame.pack(fill=BOTH, expand=True)
+
+            tb.Label(
+                no_data_frame,
+                text="📡 No sensor data available",
+                font=("Segoe UI", 14, "italic"),
+                bootstyle="secondary",
+            ).pack(expand=True)
+
+            tb.Label(
+                no_data_frame,
+                text="Connect a sensor to see live readings here",
+                font=("Segoe UI", 10),
+                bootstyle="muted",
+            ).pack()
 
     def _draw_meter(self, parent, label, value, vmin, vmax, color):
         # Draw a compact meter (bar) for a value
@@ -3381,6 +3532,94 @@ Application Status:
         tb.Label(frame, text=f"{value:.1f}", font=("Segoe UI", 9, "bold")).pack(
             side=LEFT, padx=2
         )
+
+    def _draw_enhanced_meter(self, parent, label, value, vmin, vmax, color):
+        """Draw an enhanced meter with better styling and status indicators"""
+        frame = tb.Frame(parent)
+        frame.pack(fill=X, pady=3)
+
+        # Label and value
+        label_frame = tb.Frame(frame)
+        label_frame.pack(fill=X)
+
+        tb.Label(label_frame, text=label, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
+
+        # Calculate percentage and status
+        pct = (float(value) - vmin) / (vmax - vmin) if vmax != vmin else 0
+        pct = max(0, min(1, pct))
+
+        # Status indicator
+        if pct < 0.3:
+            status = "🟢 Low"
+            status_color = "#28a745"
+        elif pct < 0.7:
+            status = "🟡 Normal"
+            status_color = "#ffc107"
+        else:
+            status = "🔴 High"
+            status_color = "#dc3545"
+
+        tb.Label(
+            label_frame,
+            text=status,
+            font=("Segoe UI", 9),
+            bootstyle="success" if pct < 0.3 else "warning" if pct < 0.7 else "danger",
+        ).pack(side=RIGHT)
+
+        # Value display
+        tb.Label(
+            label_frame,
+            text=f"{value:.2f}",
+            font=("Segoe UI", 12, "bold"),
+            bootstyle="primary",
+        ).pack(side=RIGHT, padx=(0, 10))
+
+        # Enhanced progress bar
+        bar_frame = tb.Frame(frame)
+        bar_frame.pack(fill=X, pady=(5, 0))
+
+        # Background bar
+        bg_bar = tk.Canvas(
+            bar_frame,
+            height=20,
+            bg="#e9ecef" if not self.night_mode else "#2d3748",
+            highlightthickness=0,
+            relief="sunken",
+            bd=1,
+        )
+        bg_bar.pack(fill=X)
+
+        # Progress fill
+        bar_width = bg_bar.winfo_reqwidth() if bg_bar.winfo_reqwidth() > 0 else 200
+        fill_width = bar_width * pct
+
+        # Create gradient effect
+        for i in range(int(fill_width)):
+            intensity = i / fill_width if fill_width > 0 else 0
+            # Create color gradient
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+
+            # Darken based on intensity
+            r = int(r * (0.3 + 0.7 * intensity))
+            g = int(g * (0.3 + 0.7 * intensity))
+            b = int(b * (0.3 + 0.7 * intensity))
+
+            gradient_color = f"#{r:02x}{g:02x}{b:02x}"
+            bg_bar.create_rectangle(i, 0, i + 1, 20, fill=gradient_color, outline="")
+
+        # Range labels
+        range_frame = tb.Frame(frame)
+        range_frame.pack(fill=X, pady=(2, 0))
+
+        tb.Label(
+            range_frame, text=f"{vmin}", font=("Segoe UI", 8), bootstyle="muted"
+        ).pack(side=LEFT)
+
+        tb.Label(
+            range_frame, text=f"{vmax}", font=("Segoe UI", 8), bootstyle="muted"
+        ).pack(side=RIGHT)
 
     def get_quick_stats(self):
         if self.time_data:
@@ -3569,29 +3808,29 @@ Application Status:
                 "end",
                 values=(entry["timestamp"], entry["sensor"], *vals),
             )
-        # Statistical Analysis Tools
-        stats_frame = tb.Frame(self.tab_data)
-        stats_frame.pack(pady=10, fill=BOTH, expand=True)
-
-        # Statistics header
-        tb.Label(
-            stats_frame,
-            text="Statistical Analysis Tools",
-            font=("Segoe UI", 14, "bold"),
-            bootstyle="info",
-        ).pack(anchor="w", padx=10, pady=(0, 10))
-
-        # Statistics controls
-        stats_controls = tb.Frame(stats_frame)
-        stats_controls.pack(fill=X, padx=10, pady=5)
-
-        # Sensor selection for analysis
-        tb.Label(stats_controls, text="Analyze Sensor:", bootstyle="primary").pack(
-            side=LEFT, padx=(0, 10)
+        # Statistical Analysis Tools - ENHANCED
+        stats_frame = tb.LabelFrame(
+            main_container, text="📈 Statistical Analysis Tools", bootstyle="warning"
         )
+        stats_frame.pack(fill=BOTH, expand=True, pady=(0, 15))
+
+        # Analysis controls with better layout
+        stats_controls = tb.Frame(stats_frame)
+        stats_controls.pack(fill=X, padx=10, pady=10)
+
+        # First row - Sensor selection and basic stats
+        row1 = tb.Frame(stats_controls)
+        row1.pack(fill=X, pady=(0, 10))
+
+        tb.Label(
+            row1,
+            text="Analyze Sensor:",
+            font=("Segoe UI", 10, "bold"),
+            bootstyle="primary",
+        ).pack(side=LEFT, padx=(0, 5))
         self.stats_sensor_var = tk.StringVar(value="All Sensors")
         self.stats_sensor_combo = tb.Combobox(
-            stats_controls,
+            row1,
             textvariable=self.stats_sensor_var,
             values=[
                 "All Sensors",
@@ -3604,71 +3843,215 @@ Application Status:
             ],
             state="readonly",
             width=15,
+            font=("Segoe UI", 10),
         )
-        self.stats_sensor_combo.pack(side=LEFT, padx=(0, 10))
+        self.stats_sensor_combo.pack(side=LEFT, padx=(0, 20))
 
-        # Analysis buttons
+        # Basic statistics buttons
+        basic_stats_frame = tb.Frame(row1)
+        basic_stats_frame.pack(side=LEFT, padx=(0, 20))
+
         tb.Button(
-            stats_controls,
-            text="Calculate Statistics",
+            basic_stats_frame,
+            text="📊 Basic Stats",
             command=self.calculate_statistics,
-            bootstyle="success-outline",
+            bootstyle="success",
+            width=12,
         ).pack(side=LEFT, padx=(0, 5))
 
         tb.Button(
-            stats_controls,
-            text="Generate Report",
-            command=self.generate_data_report,
-            bootstyle="info-outline",
-        ).pack(side=LEFT, padx=(0, 5))
-
-        tb.Button(
-            stats_controls,
-            text="Plot Trends",
+            basic_stats_frame,
+            text="📈 Trends",
             command=self.plot_data_trends,
-            bootstyle="warning-outline",
+            bootstyle="warning",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 5))
+
+        # Second row - Advanced analysis buttons
+        row2 = tb.Frame(stats_controls)
+        row2.pack(fill=X, pady=(0, 10))
+
+        # Advanced analysis section
+        advanced_frame = tb.Frame(row2)
+        advanced_frame.pack(side=LEFT)
+
+        tb.Label(
+            advanced_frame, text="Advanced Analysis:", font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        advanced_buttons = tb.Frame(advanced_frame)
+        advanced_buttons.pack(fill=X, pady=(5, 0))
+
+        tb.Button(
+            advanced_buttons,
+            text="📋 Generate Report",
+            command=self.generate_data_report,
+            bootstyle="info",
+            width=15,
         ).pack(side=LEFT, padx=(0, 5))
 
         tb.Button(
-            stats_controls,
-            text="Advanced Analysis",
+            advanced_buttons,
+            text="🔍 Advanced Stats",
             command=self.advanced_data_analysis,
-            bootstyle="danger-outline",
+            bootstyle="danger",
+            width=15,
         ).pack(side=LEFT, padx=(0, 5))
 
         tb.Button(
-            stats_controls,
-            text="Export CSV",
+            advanced_buttons,
+            text="📊 Correlation",
+            command=self.calculate_correlations,
+            bootstyle="primary",
+            width=15,
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            advanced_buttons,
+            text="📈 Regression",
+            command=self.perform_regression,
+            bootstyle="secondary",
+            width=15,
+        ).pack(side=LEFT, padx=(0, 5))
+
+        # Third row - Export and utility buttons
+        row3 = tb.Frame(stats_controls)
+        row3.pack(fill=X)
+
+        utility_frame = tb.Frame(row3)
+        utility_frame.pack(side=LEFT)
+
+        tb.Label(
+            utility_frame, text="Export & Utilities:", font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        utility_buttons = tb.Frame(utility_frame)
+        utility_buttons.pack(fill=X, pady=(5, 0))
+
+        tb.Button(
+            utility_buttons,
+            text="📤 Export CSV",
             command=self.export_filtered_csv,
-            bootstyle="secondary-outline",
-        ).pack(side=LEFT)
+            bootstyle="success-outline",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            utility_buttons,
+            text="📊 Export Charts",
+            command=self.export_charts,
+            bootstyle="info-outline",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 5))
+
+        tb.Button(
+            utility_buttons,
+            text="🔄 Refresh Data",
+            command=self.refresh_analysis_data,
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 5))
 
         # Statistics display area
         self.stats_display = tk.Text(
             stats_frame, height=8, state="disabled", wrap="word", font=("Consolas", 9)
         )
         self.stats_display.pack(fill=BOTH, expand=True, padx=10, pady=5)
-        # AI Data Assistant (offline)
-        ai_frame = tb.Frame(self.tab_data)
-        ai_frame.pack(pady=10, fill=BOTH, expand=True)
+        # AI Data Assistant (offline) - IMPROVED
+        ai_frame = tb.LabelFrame(
+            main_container, text="🤖 AI Data Assistant", bootstyle="info"
+        )
+        ai_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
+
+        # Chat display area with better styling
+        chat_display_frame = tb.Frame(ai_frame)
+        chat_display_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        self.ai_chat_log = tk.Text(
+            chat_display_frame,
+            height=8,
+            state="disabled",
+            wrap="word",
+            font=("Consolas", 10),
+            bg="#1e1e1e" if self.night_mode else "#ffffff",
+            fg="#ffffff" if self.night_mode else "#000000",
+            insertbackground="#ffffff" if self.night_mode else "#000000",
+        )
+        self.ai_chat_log.pack(fill=BOTH, expand=True)
+
+        # Add scrollbar to chat log
+        chat_scrollbar = tk.Scrollbar(
+            chat_display_frame, orient="vertical", command=self.ai_chat_log.yview
+        )
+        chat_scrollbar.pack(side="right", fill="y")
+        self.ai_chat_log.config(yscrollcommand=chat_scrollbar.set)
+
+        # Ensure scrollbar doesn't interfere with entry widget
+        chat_scrollbar.bind("<Button-1>", lambda e: "break")
+
+        # Chat input area with better layout
+        chat_input_frame = tb.Frame(ai_frame)
+        chat_input_frame.pack(fill=X, padx=10, pady=(0, 10))
+
+        # Input label with placeholder hint
         tb.Label(
-            ai_frame,
-            text="AI Data Assistant",
-            font=("Segoe UI", 12, "bold"),
-            bootstyle="info",
-        ).pack(anchor="w", padx=10)
-        self.ai_chat_log = tk.Text(ai_frame, height=10, state="disabled", wrap="word")
-        self.ai_chat_log.pack(fill=BOTH, expand=True, padx=10, pady=5)
-        chat_entry_frame = tb.Frame(ai_frame)
-        chat_entry_frame.pack(fill=X, padx=10, pady=5)
-        self.ai_chat_entry = tb.Entry(chat_entry_frame)
-        self.ai_chat_entry.pack(side=LEFT, fill=X, expand=True)
-        tb.Button(
-            chat_entry_frame,
+            chat_input_frame,
+            text="Ask about your data:",
+            font=("Segoe UI", 10),
+            bootstyle="secondary",
+        ).pack(anchor="w", pady=(0, 2))
+
+        # Placeholder hint
+        tb.Label(
+            chat_input_frame,
+            text="💡 Try: 'What's the average temperature?' or 'Show me trends'",
+            font=("Segoe UI", 8),
+            bootstyle="muted",
+        ).pack(anchor="w", pady=(0, 5))
+
+        # Input row
+        input_row = tb.Frame(chat_input_frame)
+        input_row.pack(fill=X)
+
+        # Simple working Entry widget
+        self.ai_chat_entry = tk.Entry(
+            input_row, font=("Segoe UI", 14), width=50, relief="solid", bd=2
+        )
+        self.ai_chat_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
+
+        # Ensure the entry widget can receive focus and input
+        self.ai_chat_entry.bind(
+            "<FocusIn>", lambda e: self.ai_chat_entry.config(state="normal")
+        )
+        self.ai_chat_entry.bind(
+            "<KeyPress>", lambda e: self.ai_chat_entry.config(state="normal")
+        )
+
+        # Send button with better styling
+        send_btn = tb.Button(
+            input_row,
             text="Send",
             command=self.handle_ai_chat,
-            bootstyle="primary-outline",
-        ).pack(side=LEFT, padx=5)
+            bootstyle="primary",
+            width=8,
+        )
+        send_btn.pack(side=RIGHT)
+
+        # Bind Enter key to send message
+        self.ai_chat_entry.bind("<Return>", lambda e: self.handle_ai_chat())
+
+        # Additional bindings to ensure proper text input
+        self.ai_chat_entry.bind("<Button-1>", lambda e: self.ai_chat_entry.focus_set())
+        self.ai_chat_entry.bind(
+            "<FocusIn>", lambda e: self.ai_chat_entry.config(state="normal")
+        )
+
+        # Force focus and ensure it's editable
+        self.ai_chat_entry.focus_set()
+        self.ai_chat_entry.config(state="normal")
+
+        # Make sure the entry widget is properly configured for text input
+        self.after(100, lambda: self.ai_chat_entry.focus_set())
 
     def handle_ai_chat(self):
         user_msg = self.ai_chat_entry.get().strip()
@@ -3683,6 +4066,173 @@ Application Status:
         except Exception as e:
             reply = f"AI error: {e}"
         self.append_ai_chat(f"AI ({self.ai_mode}): {reply}\n")
+
+    def calculate_correlations(self):
+        """Calculate correlations between different sensor readings"""
+        try:
+            df = self.get_data_df()
+            if df.empty:
+                self.show_notification(
+                    "No data available for correlation analysis.", style="warning"
+                )
+                return
+
+            # Select numeric columns only
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) < 2:
+                self.show_notification(
+                    "Need at least 2 numeric columns for correlation.", style="warning"
+                )
+                return
+
+            # Calculate correlation matrix
+            corr_matrix = df[numeric_cols].corr()
+
+            # Display results
+            self.stats_display.config(state="normal")
+            self.stats_display.delete(1.0, tk.END)
+
+            result = "📊 CORRELATION ANALYSIS\n"
+            result += "=" * 50 + "\n\n"
+
+            for i, col1 in enumerate(numeric_cols):
+                for j, col2 in enumerate(numeric_cols):
+                    if i < j:  # Only upper triangle
+                        corr_val = corr_matrix.loc[col1, col2]
+                        strength = (
+                            "Strong"
+                            if abs(corr_val) > 0.7
+                            else "Moderate"
+                            if abs(corr_val) > 0.3
+                            else "Weak"
+                        )
+                        direction = "Positive" if corr_val > 0 else "Negative"
+
+                        result += f"{col1} ↔ {col2}:\n"
+                        result += f"  Correlation: {corr_val:.3f}\n"
+                        result += f"  Strength: {strength} {direction}\n\n"
+
+            self.stats_display.insert(tk.END, result)
+            self.stats_display.config(state="disabled")
+
+        except Exception as e:
+            self.show_notification(f"Correlation analysis failed: {e}", style="danger")
+
+    def perform_regression(self):
+        """Perform simple linear regression analysis"""
+        try:
+            df = self.get_data_df()
+            if df.empty:
+                self.show_notification(
+                    "No data available for regression analysis.", style="warning"
+                )
+                return
+
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) < 2:
+                self.show_notification(
+                    "Need at least 2 numeric columns for regression.", style="warning"
+                )
+                return
+
+            # Simple linear regression between first two numeric columns
+            x_col, y_col = numeric_cols[0], numeric_cols[1]
+            x_data = df[x_col].dropna()
+            y_data = df[y_col].dropna()
+
+            # Align data
+            common_idx = x_data.index.intersection(y_data.index)
+            x_vals = x_data.loc[common_idx].values
+            y_vals = y_data.loc[common_idx].values
+
+            if len(x_vals) < 3:
+                self.show_notification(
+                    "Not enough data points for regression.", style="warning"
+                )
+                return
+
+            # Calculate regression coefficients
+            n = len(x_vals)
+            sum_x = np.sum(x_vals)
+            sum_y = np.sum(y_vals)
+            sum_xy = np.sum(x_vals * y_vals)
+            sum_x2 = np.sum(x_vals**2)
+
+            slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x**2)
+            intercept = (sum_y - slope * sum_x) / n
+
+            # Calculate R-squared
+            y_pred = slope * x_vals + intercept
+            ss_res = np.sum((y_vals - y_pred) ** 2)
+            ss_tot = np.sum((y_vals - np.mean(y_vals)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+            # Display results
+            self.stats_display.config(state="normal")
+            self.stats_display.delete(1.0, tk.END)
+
+            result = "📈 REGRESSION ANALYSIS\n"
+            result += "=" * 50 + "\n\n"
+            result += f"Predicting: {y_col} from {x_col}\n"
+            result += f"Data points: {len(x_vals)}\n\n"
+            result += f"Equation: {y_col} = {slope:.3f} × {x_col} + {intercept:.3f}\n"
+            result += f"R-squared: {r_squared:.3f}\n"
+            result += f"Slope: {slope:.3f}\n"
+            result += f"Intercept: {intercept:.3f}\n\n"
+
+            # Interpretation
+            if r_squared > 0.7:
+                result += "✅ Strong linear relationship\n"
+            elif r_squared > 0.3:
+                result += "⚠️ Moderate linear relationship\n"
+            else:
+                result += "❌ Weak linear relationship\n"
+
+            self.stats_display.insert(tk.END, result)
+            self.stats_display.config(state="disabled")
+
+        except Exception as e:
+            self.show_notification(f"Regression analysis failed: {e}", style="danger")
+
+    def export_charts(self):
+        """Export current charts and visualizations"""
+        try:
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Create charts directory
+            charts_dir = "exported_charts"
+            os.makedirs(charts_dir, exist_ok=True)
+
+            # Export any active plots
+            if hasattr(self, "current_plot_figure"):
+                chart_path = os.path.join(charts_dir, f"sensor_chart_{timestamp}.png")
+                self.current_plot_figure.savefig(
+                    chart_path, dpi=300, bbox_inches="tight"
+                )
+                self.show_notification(
+                    f"Chart exported to {chart_path}", style="success"
+                )
+            else:
+                self.show_notification(
+                    "No active charts to export. Generate a plot first.",
+                    style="warning",
+                )
+
+        except Exception as e:
+            self.show_notification(f"Chart export failed: {e}", style="danger")
+
+    def refresh_analysis_data(self):
+        """Refresh the analysis data and recalculate statistics"""
+        try:
+            # Rebuild the data tab to refresh all displays
+            self.build_data_tab()
+            self.show_notification(
+                "Analysis data refreshed successfully", style="success"
+            )
+        except Exception as e:
+            self.show_notification(f"Data refresh failed: {e}", style="danger")
 
     def append_ai_chat(self, msg):
         self.ai_chat_log.config(state="normal")
